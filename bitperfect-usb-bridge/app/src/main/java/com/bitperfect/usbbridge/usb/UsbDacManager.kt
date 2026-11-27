@@ -12,7 +12,9 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.media.AudioManager
 import android.media.projection.MediaProjection
+import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import com.bitperfect.usbbridge.BuildConfig
 import com.bitperfect.usbbridge.capture.ActiveCaptureConfig
@@ -290,6 +292,10 @@ class UsbDacManager(context: Context) {
 
     @Volatile
     private var hiResSubmixCaptureFailed: Boolean = false
+
+    // Anti-Speaker-Blast Guard: remembers user's original volume before bridge maximized it
+    @Volatile
+    private var savedPreBridgeSystemVolume: Int = -1
 
     // Auto-Heal Watchdog state (detects zeroDropout bursts in both Non-Root & Shizuku modes)
     @Volatile
@@ -655,7 +661,6 @@ class UsbDacManager(context: Context) {
             reconfigureMutex.withLock {
                 if (!_bridgeState.value.active) return@withLock
                 val targetUid = resolveEffectiveTargetUid()
-                val curRate = _bridgeState.value.sourceSpec?.sampleRate ?: _manualSampleRate.value
 
                 if (_operatingMode.value == BridgeOperatingMode.SHIZUKU_AUTO && shizukuController.state.value.isReady) {
                     specSniffer.start(
@@ -666,12 +671,113 @@ class UsbDacManager(context: Context) {
                     }
                 }
 
-                reconfigureCaptureAndHardwareLocked(
-                    sourceSampleRate = curRate,
-                    sourceTag = if (targetUid != null) "scope:single:$targetUid" else "scope:global",
-                    forceRebind = true,
-                    targetUidOverride = targetUid
-                )
+                rebindCaptureScopeInPlaceLocked(targetUid)
+            }
+        }
+    }
+
+    /**
+     * In-place AudioRecord scope swap (Global <-> Single App) WITHOUT ever closing or releasing
+     * the USB DAC! Protected by Anti-Speaker-Blast mute + media pause so switching scope on a bus
+     * or in public can NEVER blast audio through the phone's built-in speaker.
+     */
+    private suspend fun rebindCaptureScopeInPlaceLocked(targetUid: Int?) {
+        val mp = activeMediaProjection ?: return
+        val session = activeSession
+        val curHw = _bridgeState.value.dacHardware
+        val curRate = curHw?.dacSampleRate ?: _bridgeState.value.ratePlan?.effectiveSampleRate ?: _manualSampleRate.value
+        val preferredBits = _preferredBridgeBitDepth.value
+        val lowLatency = isLowLatencyMode()
+        val scopeMode = _captureScopeMode.value
+
+        if (session == null) {
+            reconfigureCaptureAndHardwareLocked(
+                sourceSampleRate = _bridgeState.value.sourceSpec?.sampleRate ?: _manualSampleRate.value,
+                sourceTag = if (targetUid != null) "scope:single:$targetUid" else "scope:global",
+                forceRebind = true,
+                targetUidOverride = targetUid
+            )
+            return
+        }
+
+        // 1. Anti-Speaker-Blast Shield: mute STREAM_MUSIC immediately, and pause playback when entering Single-App mode
+        val savedSysVol = muteStreamMusicTemporarily()
+        if (scopeMode == CaptureScopeMode.SINGLE_APP) {
+            pauseExternalMediaPlayback()
+        }
+
+        var succeeded = false
+        try {
+            appendLog(
+                1,
+                "KT",
+                "原地热切换捕获范围 (保持 USB 独占不断开，已开启防外放静音保护): " +
+                    if (targetUid != null) "单应用 UID=$targetUid" else "全局自动追踪"
+            )
+
+            capturePipeline.stopCapture()
+            NativeUsbAudioBridge.stopStream()
+
+            val hwRes = NativeUsbAudioBridge.prepareCaptureStream(
+                sampleRate = curRate,
+                preferredBitDepth = preferredBits
+            )
+            val hw = hwRes.getOrElse { err ->
+                val msg = "原地切换捕获范围后重置 DAC 管线失败: ${err.message}"
+                appendLog(3, "KT", msg)
+                _bridgeState.update { it.copy(statusMessage = msg) }
+                return
+            }
+
+            val capRes = capturePipeline.startCapture(
+                mediaProjection = mp,
+                targetUid = targetUid,
+                sampleRate = hw.dacSampleRate,
+                lowLatencyMode = lowLatency,
+                onFatalError = { err ->
+                    appendLog(3, "CAP", "音频捕获中止: $err")
+                    _bridgeState.update { it.copy(statusMessage = "捕获异常: $err") }
+                }
+            )
+            val activeCap = capRes.getOrElse { err ->
+                val msg = "原地重建 AudioRecord 失败: ${err.message}"
+                appendLog(3, "KT", msg)
+                _bridgeState.update { it.copy(statusMessage = msg) }
+                return
+            }
+
+            // Wait 120ms for AudioRecord + r_submix to lock in before restoring STREAM_MUSIC
+            delay(120L)
+
+            val prevSpec = _bridgeState.value.sourceSpec
+            val nextSpec = DetectedAudioSpec(
+                sampleRate = prevSpec?.sampleRate ?: hw.dacSampleRate,
+                bitDepth = 24,
+                sourceTag = if (targetUid != null) "scope:single:$targetUid" else "scope:global",
+                piid = prevSpec?.piid ?: 0,
+                uid = targetUid ?: -1,
+                packageName = if (scopeMode == CaptureScopeMode.SINGLE_APP) _selectedApp.value?.packageName else null,
+                appLabel = if (scopeMode == CaptureScopeMode.SINGLE_APP) _selectedApp.value?.label else null
+            )
+
+            val nextState = _bridgeState.value.copy(
+                active = true,
+                targetUid = targetUid,
+                captureScopeMode = scopeMode,
+                sourceSpec = nextSpec,
+                dacHardware = hw,
+                captureConfig = activeCap,
+                reconfigureCount = _bridgeState.value.reconfigureCount + 1
+            )
+            _bridgeState.value = nextState
+            resetAutoHealWindow()
+            nextState.formatPathSummary()?.let { UsbBridgeService.updateStatus(appContext, it) }
+            succeeded = true
+        } finally {
+            if (succeeded) {
+                restoreStreamMusicVolume(savedSysVol)
+            } else {
+                appendLog(2, "GUARD", "范围切换未完成，保持系统媒体音量为 0 以防手机扬声器外放")
             }
         }
     }
@@ -757,14 +863,75 @@ class UsbDacManager(context: Context) {
 
     fun maximizeSystemMusicVolume() {
         runCatching {
+            val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
             val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             if (max > 0) {
+                if (savedPreBridgeSystemVolume < 0 && cur < max) {
+                    savedPreBridgeSystemVolume = cur
+                }
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0)
                 _systemMusicVolume.value = SystemVolumeState(current = max, max = max)
                 appendLog(1, "KT", "已将系统媒体音量恢复至满格 ($max/$max · 0dB 数字位深无损)，请用下方 DAC 硬件音量调节响度")
             }
         }.onFailure { e ->
             appendLog(2, "KT", "自动拉满系统媒体音量受限 (${e.message})，请按手机音量+键调至满格")
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Anti-Speaker-Blast Shield (prevents 100% max-volume phone speaker blast
+    // during USB rebind, scope switch, bridge stop, or dongle unplug!)
+    // -------------------------------------------------------------------------
+
+    private fun muteStreamMusicTemporarily(): Int {
+        return runCatching {
+            val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (cur > 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            }
+            refreshSystemMusicVolume()
+            cur
+        }.getOrDefault(0)
+    }
+
+    private fun restoreStreamMusicVolume(targetVol: Int) {
+        if (targetVol <= 0) return
+        runCatching {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val clamped = targetVol.coerceIn(0, max)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, clamped, 0)
+            refreshSystemMusicVolume()
+        }
+    }
+
+    private fun restoreSafePostStopVolume() {
+        runCatching {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            if (max <= 0) return
+            // If music is somehow still active after pause dispatch, keep strictly at 0!
+            if (audioManager.isMusicActive) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                refreshSystemMusicVolume()
+                return
+            }
+            val safeCap = (max / 4).coerceAtLeast(1)
+            val safeVol = if (savedPreBridgeSystemVolume >= 0) {
+                savedPreBridgeSystemVolume.coerceIn(0, safeCap)
+            } else {
+                0
+            }
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, safeVol, 0)
+            savedPreBridgeSystemVolume = -1
+            refreshSystemMusicVolume()
+        }
+    }
+
+    private fun pauseExternalMediaPlayback() {
+        runCatching {
+            val now = SystemClock.uptimeMillis()
+            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE, 0))
+            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now + 10, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE, 0))
+            appendLog(1, "GUARD", "防外放保护已触发：已静音系统媒体通道并发送暂停指令")
         }
     }
 
@@ -1108,6 +1275,9 @@ class UsbDacManager(context: Context) {
 
                 refreshSystemMusicVolume()
                 val sysVol = _systemMusicVolume.value
+                if (savedPreBridgeSystemVolume < 0 && !sysVol.isFull) {
+                    savedPreBridgeSystemVolume = sysVol.current
+                }
                 if (!sysVol.isFull) {
                     appendLog(
                         2,
@@ -1498,55 +1668,36 @@ class UsbDacManager(context: Context) {
             return
         }
 
-        // Case 3: Cross-family rate switch, scope switch, latency mode switch, or Auto-Heal rebind
-        val savedVolumeDb = if (curSession != null) _volumeDb.value else 0.0
-        appendLog(
-            1,
-            "KT",
-            "执行安全切频重同步 [${_operatingMode.value.shortLabel}]: " +
-                "${plan.formatPathSummary("S${preferredBits}")} | 保持硬件音量=${"%.1f".format(savedVolumeDb)}dB"
-        )
-
-        capturePipeline.stopCapture()
-
-        if (curSession != null) {
-            stopPalGuardIfNeeded()
-            telemetryJob?.cancel()
-            telemetryJob = null
-            NativeUsbAudioBridge.close(restoreUnityVolume = false)
-            runCatching { curSession.connection.close() }
-            activeSession = null
-            armedDevice = targetDevice
-            delay(socProfile.rebindSettleDelayMs)
-        }
-
-        ensurePalPreWarmedIfNeeded(260L)
-
-        var capRes = capturePipeline.startCapture(
-            mediaProjection = mp,
-            targetUid = targetUid,
-            sampleRate = plan.effectiveSampleRate,
-            lowLatencyMode = lowLatency,
-            onFatalError = { err ->
-                appendLog(3, "CAP", "音频捕获中止: $err")
-                _bridgeState.update { it.copy(statusMessage = "捕获异常: $err") }
-            }
-        )
-
-        if (capRes.isFailure && plan.isHiResSubmixNative) {
-            hiResSubmixCaptureFailed = true
-            plan = computeEffectiveRatePlan(
-                sourceRate = sourceSampleRate,
-                profile = curSession?.profile,
-                submixProfile = _remoteSubmixProfile.value,
-                allowHiResSubmixNative = false
-            )
+        // Case 3: Cross-family rate switch, latency mode switch, or Auto-Heal rebind
+        // Anti-Speaker-Blast Shield: mute STREAM_MUSIC BEFORE tearing down AudioRecord/USB so
+        // Android NEVER blasts 100% volume out of the phone speaker during the ~300ms USB rebind!
+        val savedSysVolForRebind = muteStreamMusicTemporarily()
+        var rebindSucceeded = false
+        try {
+            val savedVolumeDb = if (curSession != null) _volumeDb.value else 0.0
             appendLog(
-                2,
+                1,
                 "KT",
-                "系统 r_submix 拒绝高频直采，已回退安全整数分频基准 ${plan.effectiveSampleRate} Hz"
+                "执行安全切频重同步 [${_operatingMode.value.shortLabel}] (已启用防外放静音保护): " +
+                    "${plan.formatPathSummary("S${preferredBits}")} | 保持硬件音量=${"%.1f".format(savedVolumeDb)}dB"
             )
-            capRes = capturePipeline.startCapture(
+
+            capturePipeline.stopCapture()
+
+            if (curSession != null) {
+                stopPalGuardIfNeeded()
+                telemetryJob?.cancel()
+                telemetryJob = null
+                NativeUsbAudioBridge.close(restoreUnityVolume = false)
+                runCatching { curSession.connection.close() }
+                activeSession = null
+                armedDevice = targetDevice
+                delay(socProfile.rebindSettleDelayMs)
+            }
+
+            ensurePalPreWarmedIfNeeded(260L)
+
+            var capRes = capturePipeline.startCapture(
                 mediaProjection = mp,
                 targetUid = targetUid,
                 sampleRate = plan.effectiveSampleRate,
@@ -1556,64 +1707,95 @@ class UsbDacManager(context: Context) {
                     _bridgeState.update { it.copy(statusMessage = "捕获异常: $err") }
                 }
             )
-        }
 
-        val activeCap = capRes.getOrElse { err ->
-            val msg = "AudioRecord 重建失败: ${err.message}"
-            appendLog(3, "KT", msg)
-            _bridgeState.update { it.copy(statusMessage = msg) }
-            return
-        }
-
-        delay(150L)
-
-        val newSession = openUsbSessionLocked(targetDevice, initialVolumeDb = savedVolumeDb)
-        if (newSession == null) {
-            capturePipeline.stopCapture()
-            _bridgeState.update { it.copy(statusMessage = "切频后重新接管 USB DAC 失败") }
-            return
-        }
-
-        val finalPlan = computeEffectiveRatePlan(
-            sourceRate = sourceSampleRate,
-            profile = newSession.profile,
-            submixProfile = _remoteSubmixProfile.value,
-            allowHiResSubmixNative = !hiResSubmixCaptureFailed
-        )
-        val hwResult = NativeUsbAudioBridge.prepareCaptureStream(
-            sampleRate = finalPlan.effectiveSampleRate,
-            preferredBitDepth = preferredBits
-        )
-        val hw = hwResult.getOrElse { err ->
-            val msg = "DAC 硬件切频失败 (${finalPlan.effectiveSampleRate}Hz): ${err.message}"
-            appendLog(3, "KT", msg)
-            capturePipeline.stopCapture()
-            _bridgeState.update { it.copy(statusMessage = msg) }
-            return
-        }
-
-        refreshSystemMusicVolume()
-
-        val prevCount = _bridgeState.value.reconfigureCount
-        val nextState = _bridgeState.value.copy(
-            active = true,
-            targetUid = targetUid,
-            captureScopeMode = scopeMode,
-            operatingMode = _operatingMode.value,
-            sourceSpec = effectiveSpec,
-            ratePlan = finalPlan.copy(effectiveSampleRate = hw.dacSampleRate),
-            dacHardware = hw,
-            captureConfig = activeCap,
-            reconfigureCount = prevCount + 1,
-            statusMessage = if (_operatingMode.value == BridgeOperatingMode.SHIZUKU_AUTO) {
-                "Shizuku 自动直通中 · 可切往任意音乐或音游播放"
-            } else {
-                "无 Root 独占直通中 · 可切往任意音乐或音游播放"
+            if (capRes.isFailure && plan.isHiResSubmixNative) {
+                hiResSubmixCaptureFailed = true
+                plan = computeEffectiveRatePlan(
+                    sourceRate = sourceSampleRate,
+                    profile = curSession?.profile,
+                    submixProfile = _remoteSubmixProfile.value,
+                    allowHiResSubmixNative = false
+                )
+                appendLog(
+                    2,
+                    "KT",
+                    "系统 r_submix 拒绝高频直采，已回退安全整数分频基准 ${plan.effectiveSampleRate} Hz"
+                )
+                capRes = capturePipeline.startCapture(
+                    mediaProjection = mp,
+                    targetUid = targetUid,
+                    sampleRate = plan.effectiveSampleRate,
+                    lowLatencyMode = lowLatency,
+                    onFatalError = { err ->
+                        appendLog(3, "CAP", "音频捕获中止: $err")
+                        _bridgeState.update { it.copy(statusMessage = "捕获异常: $err") }
+                    }
+                )
             }
-        )
-        _bridgeState.value = nextState
-        resetAutoHealWindow()
-        nextState.formatPathSummary()?.let { UsbBridgeService.updateStatus(appContext, it) }
+
+            val activeCap = capRes.getOrElse { err ->
+                val msg = "AudioRecord 重建失败: ${err.message}"
+                appendLog(3, "KT", msg)
+                _bridgeState.update { it.copy(statusMessage = msg) }
+                return
+            }
+
+            delay(150L)
+
+            val newSession = openUsbSessionLocked(targetDevice, initialVolumeDb = savedVolumeDb)
+            if (newSession == null) {
+                capturePipeline.stopCapture()
+                _bridgeState.update { it.copy(statusMessage = "切频后重新接管 USB DAC 失败") }
+                return
+            }
+
+            val finalPlan = computeEffectiveRatePlan(
+                sourceRate = sourceSampleRate,
+                profile = newSession.profile,
+                submixProfile = _remoteSubmixProfile.value,
+                allowHiResSubmixNative = !hiResSubmixCaptureFailed
+            )
+            val hwResult = NativeUsbAudioBridge.prepareCaptureStream(
+                sampleRate = finalPlan.effectiveSampleRate,
+                preferredBitDepth = preferredBits
+            )
+            val hw = hwResult.getOrElse { err ->
+                val msg = "DAC 硬件切频失败 (${finalPlan.effectiveSampleRate}Hz): ${err.message}"
+                appendLog(3, "KT", msg)
+                capturePipeline.stopCapture()
+                _bridgeState.update { it.copy(statusMessage = msg) }
+                return
+            }
+
+            val prevCount = _bridgeState.value.reconfigureCount
+            val nextState = _bridgeState.value.copy(
+                active = true,
+                targetUid = targetUid,
+                captureScopeMode = scopeMode,
+                operatingMode = _operatingMode.value,
+                sourceSpec = effectiveSpec,
+                ratePlan = finalPlan.copy(effectiveSampleRate = hw.dacSampleRate),
+                dacHardware = hw,
+                captureConfig = activeCap,
+                reconfigureCount = prevCount + 1,
+                statusMessage = if (_operatingMode.value == BridgeOperatingMode.SHIZUKU_AUTO) {
+                    "Shizuku 自动直通中 · 可切往任意音乐或音游播放"
+                } else {
+                    "无 Root 独占直通中 · 可切往任意音乐或音游播放"
+                }
+            )
+            _bridgeState.value = nextState
+            resetAutoHealWindow()
+            nextState.formatPathSummary()?.let { UsbBridgeService.updateStatus(appContext, it) }
+            rebindSucceeded = true
+        } finally {
+            if (rebindSucceeded) {
+                restoreStreamMusicVolume(savedSysVolForRebind)
+            } else {
+                pauseExternalMediaPlayback()
+                appendLog(2, "GUARD", "切频重绑定未完成，已保持系统媒体静音并暂停播放以防扬声器外放")
+            }
+        }
     }
 
     fun setPreferredBridgeBitDepth(bitDepth: Int) {
@@ -1646,6 +1828,10 @@ class UsbDacManager(context: Context) {
     }
 
     private suspend fun stopAudioBridgeLocked(releaseUsbToStandby: Boolean) {
+        // Anti-Speaker-Blast Shield: mute STREAM_MUSIC & pause active media BEFORE stopping capture/USB!
+        muteStreamMusicTemporarily()
+        pauseExternalMediaPlayback()
+
         specSniffer.stop()
         capturePipeline.stopCapture()
         val mp = activeMediaProjection
@@ -1680,18 +1866,20 @@ class UsbDacManager(context: Context) {
                 val name = deviceDisplayName(dev)
                 val vidPid = "%04X:%04X".format(dev.vendorId, dev.productId)
                 _connectionState.value = DacConnectionState.ArmedStandby(dev, name, vidPid)
-                refreshSystemMusicVolume()
-                appendLog(1, "KT", "已停止直通并将 USB 干净归还系统驱动，无需拔插可随时再次启动")
+                restoreSafePostStopVolume()
+                appendLog(1, "KT", "已停止直通并将 USB 干净归还系统驱动（已启用防外放保护）")
             } else {
                 UsbBridgeService.stopMediaProjectionCapture(
                     appContext,
                     "${session.profile.productName} · 待机中"
                 )
+                restoreSafePostStopVolume()
                 appendLog(1, "KT", "已停止直通并复位音频流至 Alt#0 与 0.0 dB")
             }
         } else {
             stopPalGuardIfNeeded()
             UsbBridgeService.stop(appContext)
+            restoreSafePostStopVolume()
         }
 
         if (_captureScopeMode.value == CaptureScopeMode.GLOBAL_MEDIA) {
@@ -1848,6 +2036,11 @@ class UsbDacManager(context: Context) {
 
     private suspend fun disconnectInternal(reason: String) {
         reconfigureMutex.withLock {
+            val wasBridgeActive = _bridgeState.value.active
+            if (wasBridgeActive) {
+                muteStreamMusicTemporarily()
+                pauseExternalMediaPlayback()
+            }
             specSniffer.stop()
             capturePipeline.stopCapture()
             stopPalGuardIfNeeded()
@@ -1884,7 +2077,11 @@ class UsbDacManager(context: Context) {
                 operatingMode = _operatingMode.value
             )
             _connectionState.value = DacConnectionState.Disconnected
-            refreshSystemMusicVolume()
+            if (wasBridgeActive) {
+                restoreSafePostStopVolume()
+            } else {
+                refreshSystemMusicVolume()
+            }
             refreshDevices()
         }
     }

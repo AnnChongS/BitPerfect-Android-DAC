@@ -23,8 +23,8 @@ android {
         // Android 14 (API 34) - Android 17 (pure AIDL audio stack)
         minSdk = 34
         targetSdk = 36
-        versionCode = 23
-        versionName = "1.1.1-xring-fix"
+        versionCode = 24
+        versionName = "1.1.2-anti-blast"
 
         ndk {
             // Target physical Android 14-17 arm64-v8a devices
