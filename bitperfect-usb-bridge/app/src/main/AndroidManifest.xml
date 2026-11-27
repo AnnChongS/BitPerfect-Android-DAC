@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- USB Host mode required for direct USB DAC exclusive access -->
     <uses-feature
@@ -22,10 +23,18 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Android 11+ package visibility for Apple Music UID & Shizuku ADB service -->
+    <!-- Resolve arbitrary installed audio/game apps (including DLsite Sound, rhythm games, etc.) & UID -> App info -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Android 11+ explicit package & launcher visibility for Shizuku and all launchable media/game apps -->
     <queries>
-        <package android:name="com.apple.android.music" />
         <package android:name="moe.shizuku.privileged.api" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <application
@@ -58,8 +67,6 @@
         <!--
             Foreground Service supporting connectedDevice (USB DAC lifecycle),
             mediaPlayback (background playback priority), and mediaProjection (AudioPlaybackCapture).
-            NOTE: On Android 14+, call startForeground with CONNECTED_DEVICE|MEDIA_PLAYBACK first;
-            only include MEDIA_PROJECTION after receiving MediaProjection consent.
         -->
         <service
             android:name=".service.UsbBridgeService"

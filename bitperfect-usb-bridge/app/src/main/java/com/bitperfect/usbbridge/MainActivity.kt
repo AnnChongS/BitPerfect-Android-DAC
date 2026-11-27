@@ -23,14 +23,15 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import com.bitperfect.usbbridge.i18n.AppLanguageManager
 import com.bitperfect.usbbridge.i18n.EnUsbBridgeStrings
 import com.bitperfect.usbbridge.i18n.ZhUsbBridgeStrings
-import com.bitperfect.usbbridge.shizuku.ShizukuSpecSniffer
 import com.bitperfect.usbbridge.ui.UsbBridgeDashboardScreen
+import com.bitperfect.usbbridge.usb.CaptureScopeMode
 import com.bitperfect.usbbridge.usb.UsbDacManager
 
 private val BridgeDarkColors = darkColorScheme(
@@ -104,8 +105,14 @@ class MainActivity : ComponentActivity() {
                 val isZh = AppLanguageManager.resolveIsChinese(languagePref)
                 val strings = if (isZh) ZhUsbBridgeStrings else EnUsbBridgeStrings
 
+                val remoteSubmixProfile by usbDacManager.remoteSubmixProfile.collectAsState()
                 val shizukuState by usbDacManager.shizukuState.collectAsState()
                 val operatingMode by usbDacManager.operatingMode.collectAsState()
+                val captureScopeMode by usbDacManager.captureScopeMode.collectAsState()
+                val selectedApp by usbDacManager.selectedApp.collectAsState()
+                val trackedPlayer by usbDacManager.trackedPlayer.collectAsState()
+                val installedApps by usbDacManager.installedApps.collectAsState()
+                val isScanningApps by usbDacManager.isScanningApps.collectAsState()
                 val manualSampleRate by usbDacManager.manualSampleRate.collectAsState()
                 val systemMusicVolume by usbDacManager.systemMusicVolume.collectAsState()
                 val devices by usbDacManager.discoveredDevices.collectAsState()
@@ -119,11 +126,23 @@ class MainActivity : ComponentActivity() {
                 val preferredBridgeBitDepth by usbDacManager.preferredBridgeBitDepth.collectAsState()
                 val logs by usbDacManager.logs.collectAsState()
 
+                val launchTarget = remember(captureScopeMode, selectedApp, trackedPlayer, bridgeState, installedApps) {
+                    usbDacManager.resolvePreferredLaunchTarget()
+                }
+
                 UsbBridgeDashboardScreen(
                     strings = strings,
                     languagePref = languagePref,
+                    socProfile = usbDacManager.socProfile,
+                    remoteSubmixProfile = remoteSubmixProfile,
                     shizukuState = shizukuState,
                     operatingMode = operatingMode,
+                    captureScopeMode = captureScopeMode,
+                    selectedApp = selectedApp,
+                    trackedPlayer = trackedPlayer,
+                    installedApps = installedApps,
+                    isScanningApps = isScanningApps,
+                    preferredLaunchLabel = launchTarget?.second,
                     manualSampleRate = manualSampleRate,
                     systemMusicVolume = systemMusicVolume,
                     isBatteryOptIgnored = isBatteryOptIgnored,
@@ -143,15 +162,18 @@ class MainActivity : ComponentActivity() {
                     onRefreshShizuku = { usbDacManager.refreshShizukuStatus() },
                     onRequestShizukuPermission = { usbDacManager.requestShizukuPermission() },
                     onSelectOperatingMode = { mode -> usbDacManager.setOperatingMode(mode) },
+                    onSelectCaptureScopeMode = { scope -> usbDacManager.setCaptureScopeMode(scope) },
+                    onSelectTargetApp = { app -> usbDacManager.selectTargetApp(app) },
+                    onRefreshInstalledApps = { usbDacManager.refreshInstalledApps() },
                     onSelectManualSampleRate = { rate -> usbDacManager.selectManualSampleRate(rate) },
                     onMaximizeSystemVolume = { usbDacManager.maximizeSystemMusicVolume() },
                     onRequestBatteryOptExemption = { requestIgnoreBatteryOptimizations() },
-                    onOpenAppleMusic = { openAppleMusicApp() },
+                    onOpenPreferredPlayer = { openPreferredPlayerApp() },
                     onConnectDevice = { usbDacManager.requestConnect(it.device) },
                     onClaimArmedUsbNow = { usbDacManager.claimArmedUsbNow() },
                     onDisconnect = { usbDacManager.disconnect() },
-                    onStartAppleMusicBridge = { requestStartAppleMusicBridge() },
-                    onStopAppleMusicBridge = { usbDacManager.stopAppleMusicBridge() },
+                    onStartAudioBridge = { requestStartAudioBridge() },
+                    onStopAudioBridge = { usbDacManager.stopAudioBridge() },
                     onQuickResync = { usbDacManager.quickResyncBridge() },
                     onSelectBridgeBitDepth = { bits -> usbDacManager.setPreferredBridgeBitDepth(bits) },
                     onDumpAndCopySnapshot = {
@@ -209,17 +231,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun openAppleMusicApp() {
-        val launchIntent = packageManager.getLaunchIntentForPackage(ShizukuSpecSniffer.APPLE_MUSIC_PKG)
+    private fun openPreferredPlayerApp() {
+        val target = usbDacManager.resolvePreferredLaunchTarget()
+        if (target == null) {
+            Toast.makeText(this, currentStrings().toastPickAppFirst, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (pkg, label) = target
+        val launchIntent = packageManager.getLaunchIntentForPackage(pkg)
         if (launchIntent != null) {
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(launchIntent)
         } else {
-            Toast.makeText(this, currentStrings().toastAppleMusicMissing, Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, currentStrings().toastAppMissing(label), Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun requestStartAppleMusicBridge() {
+    private fun requestStartAudioBridge() {
+        if (usbDacManager.captureScopeMode.value == CaptureScopeMode.SINGLE_APP &&
+            usbDacManager.selectedApp.value == null
+        ) {
+            Toast.makeText(this, currentStrings().toastPickAppFirst, Toast.LENGTH_SHORT).show()
+            return
+        }
         if (ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.RECORD_AUDIO

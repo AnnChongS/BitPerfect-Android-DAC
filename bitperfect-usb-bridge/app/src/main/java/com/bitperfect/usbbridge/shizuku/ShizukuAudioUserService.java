@@ -8,21 +8,21 @@ import androidx.annotation.Keep;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Shizuku UserService executing inside uid=2000 (com.android.shell, ADB authorization — ZERO Root).
  *
- * Capabilities under uid=2000:
- *  - dumpsys audio: auto-sniff Apple Music real sample rate (FormatInfo{..., sampleRate=...})
- *  - dumpsys media.audio_policy: probe r_submix HAL supported rates
- *  - deviceidle / appops / standby-bucket: keep both BitPerfect USB Bridge & Apple Music unthrottled
- *  - Zero-root PAL / AHAL_StreamOut_QTI / AudioFlinger diagnostic snapshot
+ * Universal capabilities under uid=2000 across Qualcomm / Xiaomi XRING / MediaTek / Exynos / Tensor:
+ *  - dumpsys audio: sniff ALL active media/game AudioPlaybackConfiguration sample rates
+ *  - dumpsys media.audio_policy: dynamically probe device r_submix HAL supported rates
+ *  - deviceidle / appops / standby-bucket: keep BitPerfect USB Bridge & active/selected player unthrottled
+ *  - Universal SoC / AudioFlinger / HAL diagnostic snapshot
  */
 @Keep
 public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
-
-    private static final String APPLE_MUSIC_PKG = "com.apple.android.music";
 
     @Keep
     public ShizukuAudioUserService() {
@@ -50,15 +50,16 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
 
     @Override
     public String dumpAudioPlayback(int targetUid) {
-        String uidNeedle = "u/pid:" + targetUid + "/";
         String raw = execShell("dumpsys audio", 5000L, 524288);
         if (raw.isEmpty()) return "";
 
-        StringBuilder sb = new StringBuilder(2048);
+        String uidNeedle = targetUid > 0 ? ("u/pid:" + targetUid + "/") : null;
+        StringBuilder sb = new StringBuilder(4096);
         String[] lines = raw.split("\n");
         for (String line : lines) {
-            if (line.contains(uidNeedle) ||
-                (line.contains("AudioPlaybackConfiguration") && line.contains("state:started"))) {
+            boolean isStartedPlayback = line.contains("AudioPlaybackConfiguration") && line.contains("state:started");
+            boolean matchesUid = uidNeedle != null && line.contains(uidNeedle);
+            if (isStartedPlayback || matchesUid) {
                 sb.append(line).append('\n');
             }
         }
@@ -91,13 +92,29 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
     }
 
     @Override
-    public String applyBackgroundKeepAlive(String packageName) {
-        if (packageName == null || !packageName.matches("^[a-zA-Z0-9._]+$")) {
-            return "invalid packageName";
+    public String applyBackgroundKeepAlive(String packagesCsv) {
+        if (packagesCsv == null || packagesCsv.trim().isEmpty()) {
+            return "invalid packagesCsv";
         }
-        String selfRes = applyKeepAliveForPkg(packageName);
-        String amRes = applyKeepAliveForPkg(APPLE_MUSIC_PKG);
-        return "uid=" + Process.myUid() + " | bridge=[" + selfRes + "] | appleMusic=[" + amRes + "]";
+        Set<String> validPkgs = new LinkedHashSet<>();
+        for (String token : packagesCsv.split(",")) {
+            String pkg = token.trim();
+            if (pkg.matches("^[a-zA-Z0-9._]+$")) {
+                validPkgs.add(pkg);
+                if (validPkgs.size() >= 6) break;
+            }
+        }
+        if (validPkgs.isEmpty()) {
+            return "no valid packages";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("uid=").append(Process.myUid());
+        for (String pkg : validPkgs) {
+            String res = applyKeepAliveForPkg(pkg);
+            sb.append(" | ").append(pkg).append("=[").append(res).append("]");
+        }
+        return sb.toString();
     }
 
     private static String applyKeepAliveForPkg(String pkg) {
@@ -114,17 +131,26 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
     @Override
     public String dumpDiagnosticsSnapshot(int targetUid, String packageName) {
         StringBuilder sb = new StringBuilder(16384);
-        sb.append("========== Shizuku (uid=").append(Process.myUid()).append(") 音频路由与 PAL 诊断快照 ==========\n");
+        sb.append("========== Shizuku (uid=").append(Process.myUid()).append(") 全平台音频路由与 HAL 诊断快照 ==========\n");
+
+        String socMfg = execShell("getprop ro.soc.manufacturer", 2000L, 256).trim();
+        String socModel = execShell("getprop ro.soc.model", 2000L, 256).trim();
+        String platform = execShell("getprop ro.board.platform", 2000L, 256).trim();
+        String hw = execShell("getprop ro.hardware", 2000L, 256).trim();
+        sb.append("SoC Props: mfg=").append(socMfg)
+          .append(" | model=").append(socModel)
+          .append(" | platform=").append(platform)
+          .append(" | hw=").append(hw).append('\n');
 
         String routingPref = execShell("settings get secure usb_audio_automatic_routing_disabled", 3000L, 1024).trim();
         sb.append("usb_audio_automatic_routing_disabled = ").append(routingPref).append('\n');
 
-        sb.append("--- dumpsys audio (Apple Music UID=").append(targetUid).append(" & USB devices) ---\n");
+        sb.append("--- dumpsys audio (Active Playback & USB devices, targetUid=").append(targetUid).append(") ---\n");
         String audioDump = execShell("dumpsys audio", 5000L, 524288);
-        String uidNeedle = "u/pid:" + targetUid + "/";
+        String uidNeedle = targetUid > 0 ? ("u/pid:" + targetUid + "/") : null;
         int audioLines = 0;
         for (String line : audioDump.split("\n")) {
-            if (line.contains(uidNeedle) ||
+            if ((uidNeedle != null && line.contains(uidNeedle)) ||
                 line.contains("USB_HEADSET") ||
                 line.contains("USB_DEVICE") ||
                 line.contains("usb_headset") ||
@@ -133,7 +159,7 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
                 line.contains("mConnectedDevices") ||
                 (line.contains("AudioPlaybackConfiguration") && line.contains("state:started"))) {
                 sb.append("  ").append(line.trim()).append('\n');
-                if (++audioLines >= 45) break;
+                if (++audioLines >= 55) break;
             }
         }
 
@@ -151,7 +177,7 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
                 line.contains("overrun") ||
                 line.contains("r_submix") ||
                 line.contains("IoHandle") ||
-                line.contains(String.valueOf(targetUid))) {
+                (targetUid > 0 && line.contains(String.valueOf(targetUid)))) {
                 sb.append("  ").append(line.trim()).append('\n');
                 if (++flingerLines >= 60) break;
             }
@@ -166,14 +192,14 @@ public class ShizukuAudioUserService extends IShizukuAudioService.Stub {
             if (++submixLines >= 35) break;
         }
 
-        sb.append("--- recent logcat (PAL / AHAL_StreamOut_QTI / AudioFlinger / r_submix) ---\n");
+        sb.append("--- recent logcat (AudioHAL / PAL / r_submix / AudioFlinger / USB) ---\n");
         String logcat = execShell(
-                "logcat -d -t 200 | grep -E 'PAL:|AHAL_StreamOut|pal_stream|r_submix|RemoteSubmix|Duplicating|AudioFlinger|underrun|overrun' | tail -n 45",
+                "logcat -d -t 200 | grep -Ei 'PAL:|AHAL_StreamOut|pal_stream|r_submix|RemoteSubmix|Duplicating|AudioFlinger|underrun|overrun|usb_audio|xring|mtk.*audio|exynos.*audio' | tail -n 45",
                 5000L,
                 131072
         );
         if (logcat.trim().isEmpty()) {
-            sb.append("  (最近 200 行 logcat 无 PAL/AHAL/r_submix 报错)\n");
+            sb.append("  (最近 200 行 logcat 无 AudioHAL/r_submix 报错)\n");
         } else {
             for (String line : logcat.split("\n")) {
                 if (!line.trim().isEmpty()) {

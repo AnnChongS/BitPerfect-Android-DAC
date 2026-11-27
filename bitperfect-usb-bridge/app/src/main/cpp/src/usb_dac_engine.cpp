@@ -201,8 +201,14 @@ void UsbDacEngine::claimAudioInterfacesLocked() {
         }
     }
 
+    // Cross-SoC USB host settle delay (Qualcomm xHCI / XRING / MediaTek MUSB-xHCI / Samsung Exynos):
+    // Give the kernel usb_audio_disconnect() & host controller 15ms to settle before detaching IF#0.
+    if (!playbackStreamIfaces.empty() && !controlIfaces.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+
     // Stage 2: Detach & claim AudioControl IF#0 ONLY
-    // (Capture/Mic IF#1 is NEVER touched so ClockSource #27 & Android input routing stay undisturbed!)
+    // (Capture/Mic IF#1 is NEVER touched so ADC clocks & mtk-usb-offload/exynos capture IRQs stay undisturbed!)
     for (int acIf : controlIfaces) {
         int active = libusb_kernel_driver_active(handle_, acIf);
         if (active == 1) {
@@ -249,7 +255,7 @@ bool UsbDacEngine::openAndInspect(
     std::string& outError
 ) {
     std::lock_guard<std::mutex> lock(mutex_);
-    closeLocked(false, false);
+    closeLocked(false);
 
     if (fd < 0) {
         outError = "Invalid USB file descriptor (< 0)";
@@ -457,7 +463,7 @@ bool UsbDacEngine::setHardwareVolumeDb(double db, std::string& outError) {
 }
 
 void UsbDacEngine::setBufferDurationMs(int bufferMs) {
-    int clamped = std::clamp(bufferMs, 100, 600);
+    int clamped = std::clamp(bufferMs, 60, 600);
     bufferDurationMs_.store(clamped, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -943,10 +949,12 @@ size_t UsbDacEngine::pushCapturedPcmFrames(const uint8_t* data, size_t frameCoun
 
     const size_t written = ringBuffer_.write(captureScratch_.data(), bytesToWrite);
 
-    // Pre-fill completion trigger: 60% of targetBytes (e.g. 60% of 250ms = 150ms),
-    // safely absorbing 48ms of initial 12 USB URBs while staying centered in the 10%..92% deadband.
+    // Pre-fill completion trigger: 75% for low-latency rhythm-game mode (<=85ms, absorbs 24ms DMA ring),
+    // 60% for Hi-Fi mode (>85ms, e.g. 60% of 250ms = 150ms, absorbs 48ms DMA ring inside 10%..92% deadband).
     if (prefilling && targetBytes > 0) {
-        const size_t prefillThreshold = (targetBytes * 60u) / 100u;
+        const int curTargetMs = bufferDurationMs_.load(std::memory_order_relaxed);
+        const size_t prefillPct = (curTargetMs <= 85) ? 75u : 60u;
+        const size_t prefillThreshold = (targetBytes * prefillPct) / 100u;
         if (ringBuffer_.availableRead() >= prefillThreshold) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (captureArmed_.load(std::memory_order_acquire) &&
@@ -1014,20 +1022,27 @@ void UsbDacEngine::stopStreamLocked() {
     ringBuffer_.reset();
 }
 
-void UsbDacEngine::close(bool restoreUnityVolume, bool resetUsbPort) {
+void UsbDacEngine::close(bool restoreUnityVolume) {
     std::lock_guard<std::mutex> lock(mutex_);
-    closeLocked(restoreUnityVolume, resetUsbPort);
+    closeLocked(restoreUnityVolume);
 }
 
-void UsbDacEngine::closeLocked(bool restoreUnityVolume, bool resetUsbPort) {
+void UsbDacEngine::closeLocked(bool restoreUnityVolume) {
+    const bool wasActive = isoStreamer_.isRunning() || hardwareConfigured_;
     stopStreamLocked();
 
     if (handle_) {
-        // 1. Return claimed AudioStreaming interfaces (IF#2) to Alt#0 (zero-bandwidth idle)
+        // 1. Universal SoC Bus Settle (30ms): wait for host xHCI/MUSB controller DMA to quiesce
+        //    after all in-flight URBs have drained, BEFORE switching Alt#0 or releasing interfaces.
+        if (wasActive) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+
+        // 2. Return claimed AudioStreaming interfaces (e.g. IF#2) to Alt#0 (zero-bandwidth idle)
         resetAllStreamingInterfacesToAlt0Locked();
         hardwareConfigured_ = false;
 
-        // 2. Restore FeatureUnit volume to 0.00 dB ONLY on final user release (not during rate-switch rebind!)
+        // 3. Restore FeatureUnit volume to 0.00 dB ONLY on final user release (not during rate-switch rebind!)
         if (restoreUnityVolume && isOpen_ && profile_.hasPlaybackFeatureUnit) {
             unmuteFeatureUnitLocked();
             if (profile_.playbackFeatureUnit.masterVolume || profile_.playbackFeatureUnit.channelVolume) {
@@ -1038,22 +1053,23 @@ void UsbDacEngine::closeLocked(bool restoreUnityVolume, bool resetUsbPort) {
             }
         }
 
-        // 3. Release all libusb-claimed interfaces FIRST so kernel usbfs clears ps->ifclaimed
+        // 4. Progressively release all libusb-claimed interfaces (15ms settle gap between releases)
+        //    so non-Qualcomm USB host controllers (XRING / Exynos / Dimensity) never race on usbfs teardown.
         std::set<int> releasedIfaces(claimedInterfaces_.begin(), claimedInterfaces_.end());
+        bool firstRelease = true;
         for (int ifNum : claimedInterfaces_) {
+            if (!firstRelease) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+            firstRelease = false;
             int rc = libusb_release_interface(handle_, ifNum);
             BP_LOGI("libusb_release_interface(IF#%d) -> %s", ifNum, libusb_error_name(rc));
         }
         claimedInterfaces_.clear();
 
-        // 4. Cleanly re-attach Linux snd-usb-audio (IF#0 first -> usb_audio_probe -> IF#2) WITHOUT
-        //    destructive USB port reset! This restores /dev/snd/pcmC*D*p so subsequent PAL pre-warms
-        //    and re-connections work identically to a fresh physical plug-in!
-        if (resetUsbPort) {
-            int rcReset = libusb_reset_device(handle_);
-            BP_LOGI("libusb_reset_device(handle) -> %s",
-                    rcReset == LIBUSB_SUCCESS ? "OK (USB port reset complete)" : libusb_error_name(rcReset));
-        }
+        // 5. Cleanly re-attach Linux snd-usb-audio (IF#0 first -> usb_audio_probe -> IF#2).
+        //    libusb_reset_device() is PERMANENTLY FORBIDDEN across all SoCs to prevent xHCI/MUSB
+        //    port-hangs and infinite hotplug disconnect/reconnect loops on Exynos/MediaTek/XRING.
         for (int ifNum : releasedIfaces) {
             int activeBefore = libusb_kernel_driver_active(handle_, ifNum);
             if (activeBefore == 0) {
@@ -1069,7 +1085,7 @@ void UsbDacEngine::closeLocked(bool restoreUnityVolume, bool resetUsbPort) {
             }
         }
 
-        // 5. Close libusb device handle
+        // 6. Close libusb device handle
         libusb_close(handle_);
         handle_ = nullptr;
         BP_LOGI("libusb device handle closed");

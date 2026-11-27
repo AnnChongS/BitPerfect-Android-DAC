@@ -164,7 +164,7 @@ class UsbBridgeService : Service() {
             }
             ACTION_START_PROJECTION -> {
                 acquireWakeLock()
-                val statusText = intent.getStringExtra(EXTRA_STATUS_TEXT) ?: "Apple Music 独占直通中"
+                val statusText = intent.getStringExtra(EXTRA_STATUS_TEXT) ?: "BitPerfect USB 独占直通中"
                 // CRITICAL Android 14-17 rule:
                 // Call startForeground with MEDIA_PROJECTION BEFORE getMediaProjection()!
                 val ok = startForegroundWithTypes(

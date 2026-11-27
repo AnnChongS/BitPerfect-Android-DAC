@@ -46,7 +46,7 @@ public:
         std::string& outError
     );
 
-    void close(bool restoreUnityVolume = true, bool resetUsbPort = false);
+    void close(bool restoreUnityVolume = true);
 
     // Phase 2: Start or hot-switch 440Hz reference sine wave at (sampleRate, preferredBitDepth)
     bool startSineTest(uint32_t sampleRate, int preferredBitDepth, std::string& outError);
@@ -73,7 +73,7 @@ public:
     bool setHardwareVolumeDb(double db, std::string& outError);
     double getCurrentVolumeDb() const { return currentVolumeDb_.load(std::memory_order_relaxed); }
 
-    // Ring buffer duration control (100ms - 600ms, default 250ms)
+    // Ring buffer duration control (60ms low-latency rhythm-game mode - 600ms Hi-Fi mode)
     void setBufferDurationMs(int bufferMs);
     int getBufferDurationMs() const { return bufferDurationMs_.load(std::memory_order_relaxed); }
 
@@ -100,7 +100,7 @@ private:
         unsigned int timeoutMs
     );
     void stopStreamLocked();
-    void closeLocked(bool restoreUnityVolume = true, bool resetUsbPort = false);
+    void closeLocked(bool restoreUnityVolume = true);
 
     const uac::AudioStreamAltSetting* selectPlaybackAltLocked(
         uint32_t sampleRate,

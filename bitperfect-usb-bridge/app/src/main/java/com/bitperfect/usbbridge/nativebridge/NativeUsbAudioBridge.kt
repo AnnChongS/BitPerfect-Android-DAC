@@ -133,7 +133,7 @@ object NativeUsbAudioBridge {
 
     private external fun nativeGetLastReport(): String
 
-    private external fun nativeClose(restoreUnityVolume: Boolean, resetUsbPort: Boolean)
+    private external fun nativeClose(restoreUnityVolume: Boolean)
 
     private external fun nativeStartSineTest(sampleRate: Int, preferredBitDepth: Int): String
 
@@ -316,8 +316,8 @@ object NativeUsbAudioBridge {
         }
     }
 
-    fun close(restoreUnityVolume: Boolean = true, resetUsbPort: Boolean = false) {
-        nativeClose(restoreUnityVolume, resetUsbPort)
+    fun close(restoreUnityVolume: Boolean = true) {
+        nativeClose(restoreUnityVolume)
     }
 
     private fun parseSimpleOkResponse(rawJson: String): Result<Unit> {

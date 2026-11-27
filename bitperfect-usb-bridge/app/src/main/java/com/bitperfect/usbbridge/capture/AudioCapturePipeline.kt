@@ -16,23 +16,27 @@ data class ActiveCaptureConfig(
     val sampleRate: Int,
     val channels: Int = 2,
     val recordBufferBytes: Int = 0,
-    val monoPipePreFillDelayMs: Int = 40
+    val monoPipePreFillDelayMs: Int = 40,
+    val lowLatencyMode: Boolean = false,
+    val targetUid: Int? = null
 ) {
     val frameBytes: Int
         get() = channels * 4 // ENCODING_PCM_FLOAT = 4 bytes/sample * 2ch = 8 bytes/frame
 }
 
 /**
- * Production MediaProjection AudioPlaybackCapture pipeline:
+ * Universal MediaProjection AudioPlaybackCapture pipeline:
+ *  - Supports BOTH Global Media/Game Tracking (excludeUid(myUid)) and Single-App Lock (addMatchingUid)
+ *  - Captures USAGE_MEDIA + USAGE_GAME (rhythm games) + USAGE_UNKNOWN (non-mainstream audio apps)
  *  - High-precision 32-bit IEEE Float (ENCODING_PCM_FLOAT, 8B/frame) matching AudioFlinger internal mixer
- *  - 40ms MonoPipe pre-fill phase offset before first blocking read (zero boundary underrun)
- *  - 200ms frame-aligned AudioRecord buffer + URGENT_AUDIO thread priority
+ *  - Adaptive Hi-Fi (200ms buffer / 40ms pre-fill / 20ms chunks) & Rhythm-Game Low-Latency (60ms / 20ms / 10ms)
  */
 class AudioCapturePipeline(
     private val onLog: (level: Int, msg: String) -> Unit
 ) {
     companion object {
-        private const val DEFAULT_MONO_PIPE_PREFILL_MS = 40
+        private const val HIFI_MONO_PIPE_PREFILL_MS = 40
+        private const val LOW_LATENCY_MONO_PIPE_PREFILL_MS = 20
     }
 
     private val running = AtomicBoolean(false)
@@ -49,18 +53,23 @@ class AudioCapturePipeline(
     @SuppressLint("MissingPermission")
     fun startCapture(
         mediaProjection: MediaProjection,
-        targetUid: Int,
+        targetUid: Int?,
         sampleRate: Int,
+        lowLatencyMode: Boolean = false,
         onFatalError: (String) -> Unit
     ): Result<ActiveCaptureConfig> {
         stopCapture()
 
         val captureBuilder = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
 
-        if (targetUid > 0) {
+        if (targetUid != null && targetUid > 0) {
             captureBuilder.addMatchingUid(targetUid)
+        } else {
+            // Global Media & Game Mode: capture any third-party app while excluding ourselves to prevent feedback loop
+            captureBuilder.excludeUid(Process.myUid())
         }
         val captureConfig = captureBuilder.build()
 
@@ -80,9 +89,15 @@ class AudioCapturePipeline(
             if (minBuf <= 0) {
                 lastError = "getMinBufferSize(${sampleRate}Hz, PCM_FLOAT)=$minBuf"
             } else {
-                // 200ms AudioRecord internal buffer aligned to 8-byte stereo float frame
-                val target200msBytes = ((sampleRate * frameBytes) / 5 / frameBytes) * frameBytes
-                val bufferBytes = maxOf(minBuf * 4, target200msBytes)
+                val targetBufMs = if (lowLatencyMode) 60 else 200
+                val targetBytes = ((sampleRate * targetBufMs) / 1000) * frameBytes
+                val minMultiplier = if (lowLatencyMode) 2 else 4
+                val bufferBytes = maxOf(minBuf * minMultiplier, targetBytes)
+                val preFillDelayMs = if (lowLatencyMode) {
+                    LOW_LATENCY_MONO_PIPE_PREFILL_MS
+                } else {
+                    HIFI_MONO_PIPE_PREFILL_MS
+                }
 
                 val audioFormat = AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
@@ -102,7 +117,9 @@ class AudioCapturePipeline(
                         sampleRate = rec.sampleRate,
                         channels = channels,
                         recordBufferBytes = bufferBytes,
-                        monoPipePreFillDelayMs = DEFAULT_MONO_PIPE_PREFILL_MS
+                        monoPipePreFillDelayMs = preFillDelayMs,
+                        lowLatencyMode = lowLatencyMode,
+                        targetUid = targetUid
                     )
                 } else {
                     lastError = "AudioRecord.STATE_INITIALIZED failed for ${sampleRate}Hz PCM_FLOAT"
@@ -124,10 +141,16 @@ class AudioCapturePipeline(
         audioRecord = finalRecord
         running.set(true)
 
+        val scopeDesc = if (targetUid != null && targetUid > 0) {
+            "单应用锁定 UID=$targetUid"
+        } else {
+            "全局媒体/音游追踪 (excludeSelf=${Process.myUid()})"
+        }
+        val latencyTag = if (lowLatencyMode) "低延迟音游 ~60ms" else "Hi-Fi 抗抖动 ~200ms"
         onLog(
             1,
-            "AudioPlaybackCapture 已初始化: UID=$targetUid | ${finalCfg.sampleRate} Hz | " +
-                "PCM_FLOAT (32-bit float, 8B/帧) | Buf=${finalCfg.recordBufferBytes}B (~200ms) | " +
+            "AudioPlaybackCapture 已初始化: $scopeDesc | ${finalCfg.sampleRate} Hz | " +
+                "PCM_FLOAT (USAGE_MEDIA+GAME+UNKNOWN) | Buf=${finalCfg.recordBufferBytes}B ($latencyTag) | " +
                 "MonoPipe预蓄水=${finalCfg.monoPipePreFillDelayMs}ms"
         )
 
@@ -180,8 +203,10 @@ class AudioCapturePipeline(
         }
 
         val frameBytes = cfg.frameBytes
-        // 20ms read chunks aligned strictly to 8-byte PCM_FLOAT stereo frame
-        val chunkFrames = maxOf(128, cfg.sampleRate / 50)
+        // 10ms read chunks in low-latency rhythm-game mode, 20ms in standard Hi-Fi mode
+        val chunkDivisor = if (cfg.lowLatencyMode) 100 else 50
+        val chunkMsLabel = if (cfg.lowLatencyMode) 10 else 20
+        val chunkFrames = maxOf(128, cfg.sampleRate / chunkDivisor)
         val chunkBytes = chunkFrames * frameBytes
         val directBuf = ByteBuffer.allocateDirect(chunkBytes).order(ByteOrder.nativeOrder())
 
@@ -189,6 +214,9 @@ class AudioCapturePipeline(
         var misalignedReads = 0L
         var maxReadGapMs = 0L
         var lastReadEndNs = 0L
+
+        val healthIntervalReads = if (cfg.lowLatencyMode) 500L else 250L
+        val silenceBlocksThreshold = if (cfg.lowLatencyMode) 360 else 180 // ~3.6s
 
         try {
             record.startRecording()
@@ -204,7 +232,7 @@ class AudioCapturePipeline(
 
             onLog(
                 1,
-                "AudioRecord 捕获线程已启动 (tid=$tid, chunk=$chunkFrames frames / ${chunkBytes}B = 20ms, PCM_FLOAT)"
+                "AudioRecord 捕获线程已启动 (tid=$tid, chunk=$chunkFrames frames / ${chunkBytes}B = ${chunkMsLabel}ms, PCM_FLOAT)"
             )
 
             var consecutiveZeroBlocks = 0
@@ -247,7 +275,7 @@ class AudioCapturePipeline(
                                     "SPSC=${"%.1f".format(tel.bufferFillPercent)}% " +
                                     "(${"%.1f".format(tel.bufferedMs)}/${tel.targetBufferMs}ms)"
                             )
-                        } else if (totalReads % 250L == 0L) {
+                        } else if (totalReads % healthIntervalReads == 0L) {
                             val tel = NativeUsbAudioBridge.getTelemetry()
                             onLog(
                                 1,
@@ -262,12 +290,12 @@ class AudioCapturePipeline(
                         val alignedBytes = framesRead * frameBytes
                         if (!warnedSilence && isBlockAllZero(directBuf, alignedBytes)) {
                             consecutiveZeroBlocks++
-                            if (consecutiveZeroBlocks == 180) { // ~3.6s
+                            if (consecutiveZeroBlocks == silenceBlocksThreshold) {
                                 warnedSilence = true
                                 onLog(
                                     2,
-                                    "提示: 已连续 3.6 秒捕获到纯静音。请确认：(1) Apple Music 正在播放；" +
-                                        "(2) 手机系统媒体音量非 0（建议满格）；(3) 未同时开启 Root+LSPosed 版拦截。"
+                                    "提示: 已连续 3.6 秒捕获到纯静音。请确认：(1) 目标音乐/音游应用正在播放；" +
+                                        "(2) 手机系统媒体音量非 0（建议满格）；(3) 若目标应用声明禁止内录 (allowAudioPlaybackCapture=false) 将无法在无 Root 下捕获。"
                                 )
                             }
                         } else if (consecutiveZeroBlocks > 0) {

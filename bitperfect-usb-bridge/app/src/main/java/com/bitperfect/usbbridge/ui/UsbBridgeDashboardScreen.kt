@@ -1,5 +1,6 @@
 package com.bitperfect.usbbridge.ui
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -27,6 +29,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
@@ -35,6 +38,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -42,6 +46,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -51,14 +57,21 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.bitperfect.usbbridge.BuildConfig
+import com.bitperfect.usbbridge.capture.InstalledAudioApp
+import com.bitperfect.usbbridge.capture.ResolvedUidApp
 import com.bitperfect.usbbridge.i18n.LanguagePref
 import com.bitperfect.usbbridge.i18n.UsbBridgeStrings
 import com.bitperfect.usbbridge.nativebridge.StreamTelemetry
+import com.bitperfect.usbbridge.platform.SocCompatibilityProfile
+import com.bitperfect.usbbridge.shizuku.RemoteSubmixProfile
 import com.bitperfect.usbbridge.shizuku.ShizukuConnectionState
 import com.bitperfect.usbbridge.shizuku.SnifferStatus
-import com.bitperfect.usbbridge.usb.AppleMusicBridgeState
+import com.bitperfect.usbbridge.usb.AudioBridgeState
 import com.bitperfect.usbbridge.usb.BridgeOperatingMode
+import com.bitperfect.usbbridge.usb.CaptureScopeMode
 import com.bitperfect.usbbridge.usb.DacConnectionState
 import com.bitperfect.usbbridge.usb.DiscoveredUsbAudioDevice
 import com.bitperfect.usbbridge.usb.LogEntry
@@ -99,21 +112,30 @@ private val SINE_PRESETS = listOf(
     SineTestPreset(192000, 24, "192 kHz")
 )
 
-private val BUFFER_PRESETS_MS = listOf(150, 250, 350, 500)
+// 60ms = Rhythm-game low-latency mode; 150 / 250 / 400ms = Hi-Fi jitter-free modes
+private val BUFFER_PRESETS_MS = listOf(60, 150, 250, 400)
 
 @Composable
 fun UsbBridgeDashboardScreen(
     strings: UsbBridgeStrings,
     languagePref: LanguagePref,
+    socProfile: SocCompatibilityProfile,
+    remoteSubmixProfile: RemoteSubmixProfile?,
     shizukuState: ShizukuConnectionState,
     operatingMode: BridgeOperatingMode,
+    captureScopeMode: CaptureScopeMode,
+    selectedApp: InstalledAudioApp?,
+    trackedPlayer: ResolvedUidApp?,
+    installedApps: List<InstalledAudioApp>,
+    isScanningApps: Boolean,
+    preferredLaunchLabel: String?,
     manualSampleRate: Int,
     systemMusicVolume: SystemVolumeState,
     isBatteryOptIgnored: Boolean,
     devices: List<DiscoveredUsbAudioDevice>,
     connectionState: DacConnectionState,
     telemetry: StreamTelemetry,
-    bridgeState: AppleMusicBridgeState,
+    bridgeState: AudioBridgeState,
     snifferStatus: SnifferStatus,
     selectedPreset: SineTestPreset,
     volumeDb: Double,
@@ -126,15 +148,18 @@ fun UsbBridgeDashboardScreen(
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
     onSelectOperatingMode: (BridgeOperatingMode) -> Unit,
+    onSelectCaptureScopeMode: (CaptureScopeMode) -> Unit,
+    onSelectTargetApp: (InstalledAudioApp) -> Unit,
+    onRefreshInstalledApps: () -> Unit,
     onSelectManualSampleRate: (Int) -> Unit,
     onMaximizeSystemVolume: () -> Unit,
     onRequestBatteryOptExemption: () -> Unit,
-    onOpenAppleMusic: () -> Unit,
+    onOpenPreferredPlayer: () -> Unit,
     onConnectDevice: (DiscoveredUsbAudioDevice) -> Unit,
     onClaimArmedUsbNow: () -> Unit,
     onDisconnect: () -> Unit,
-    onStartAppleMusicBridge: () -> Unit,
-    onStopAppleMusicBridge: () -> Unit,
+    onStartAudioBridge: () -> Unit,
+    onStopAudioBridge: () -> Unit,
     onQuickResync: () -> Unit,
     onSelectBridgeBitDepth: (Int) -> Unit,
     onDumpAndCopySnapshot: () -> Unit,
@@ -148,6 +173,7 @@ fun UsbBridgeDashboardScreen(
     onCopyReport: (String) -> Unit
 ) {
     var activeTab by remember { mutableIntStateOf(0) }
+    var showAppPickerDialog by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -163,6 +189,8 @@ fun UsbBridgeDashboardScreen(
             item {
                 HeaderSection(
                     s = strings,
+                    socProfile = socProfile,
+                    remoteSubmixProfile = remoteSubmixProfile,
                     connectionState = connectionState,
                     bridgeState = bridgeState,
                     telemetry = telemetry,
@@ -197,6 +225,10 @@ fun UsbBridgeDashboardScreen(
                     s = strings,
                     shizukuState = shizukuState,
                     operatingMode = operatingMode,
+                    captureScopeMode = captureScopeMode,
+                    selectedApp = selectedApp,
+                    trackedPlayer = trackedPlayer,
+                    preferredLaunchLabel = preferredLaunchLabel,
                     manualSampleRate = manualSampleRate,
                     systemMusicVolume = systemMusicVolume,
                     connectionState = connectionState,
@@ -205,14 +237,39 @@ fun UsbBridgeDashboardScreen(
                     telemetry = telemetry,
                     preferredBitDepth = preferredBridgeBitDepth,
                     onSelectOperatingMode = onSelectOperatingMode,
+                    onSelectCaptureScopeMode = { nextScope ->
+                        onSelectCaptureScopeMode(nextScope)
+                        if (nextScope == CaptureScopeMode.SINGLE_APP && selectedApp == null) {
+                            if (installedApps.isEmpty()) onRefreshInstalledApps()
+                            showAppPickerDialog = true
+                        }
+                    },
+                    onOpenAppPicker = {
+                        if (installedApps.isEmpty()) onRefreshInstalledApps()
+                        showAppPickerDialog = true
+                    },
                     onSelectManualSampleRate = onSelectManualSampleRate,
                     onRefreshShizuku = onRefreshShizuku,
                     onRequestShizukuPermission = onRequestShizukuPermission,
                     onMaximizeSystemVolume = onMaximizeSystemVolume,
-                    onStartBridge = onStartAppleMusicBridge,
-                    onStopBridge = onStopAppleMusicBridge,
+                    onStartBridge = {
+                        if (captureScopeMode == CaptureScopeMode.SINGLE_APP && selectedApp == null) {
+                            if (installedApps.isEmpty()) onRefreshInstalledApps()
+                            showAppPickerDialog = true
+                        } else {
+                            onStartAudioBridge()
+                        }
+                    },
+                    onStopBridge = onStopAudioBridge,
                     onQuickResync = onQuickResync,
-                    onOpenAppleMusic = onOpenAppleMusic
+                    onOpenPlayerOrPicker = {
+                        if (preferredLaunchLabel != null) {
+                            onOpenPreferredPlayer()
+                        } else {
+                            if (installedApps.isEmpty()) onRefreshInstalledApps()
+                            showAppPickerDialog = true
+                        }
+                    }
                 )
             }
 
@@ -234,6 +291,8 @@ fun UsbBridgeDashboardScreen(
                 WorkbenchCard(
                     s = strings,
                     languagePref = languagePref,
+                    socProfile = socProfile,
+                    remoteSubmixProfile = remoteSubmixProfile,
                     onSelectLanguagePref = onSelectLanguagePref,
                     activeTab = activeTab,
                     onSelectTab = { activeTab = it },
@@ -252,13 +311,30 @@ fun UsbBridgeDashboardScreen(
             }
         }
     }
+
+    if (showAppPickerDialog) {
+        AppPickerDialog(
+            s = strings,
+            installedApps = installedApps,
+            selectedPackageName = selectedApp?.packageName,
+            isScanning = isScanningApps,
+            onRefresh = onRefreshInstalledApps,
+            onSelectApp = { app ->
+                onSelectTargetApp(app)
+                showAppPickerDialog = false
+            },
+            onDismiss = { showAppPickerDialog = false }
+        )
+    }
 }
 
 @Composable
 private fun HeaderSection(
     s: UsbBridgeStrings,
+    socProfile: SocCompatibilityProfile,
+    remoteSubmixProfile: RemoteSubmixProfile?,
     connectionState: DacConnectionState,
-    bridgeState: AppleMusicBridgeState,
+    bridgeState: AudioBridgeState,
     telemetry: StreamTelemetry,
     onToggleLanguage: () -> Unit
 ) {
@@ -281,7 +357,7 @@ private fun HeaderSection(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 2.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
+        verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -352,6 +428,47 @@ private fun HeaderSection(
             lineHeight = 16.sp,
             style = TightTextStyle
         )
+
+        // Compact Universal SoC + r_submix Capability Pill Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(TileBg)
+                    .border(1.dp, CardBorder, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = socProfile.headerBadge(s.isZh),
+                    color = CyanPrimary,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    style = TightTextStyle
+                )
+            }
+
+            if (remoteSubmixProfile != null && remoteSubmixProfile.maxSupportedRate > 48000) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(EmeraldDimBg)
+                        .border(1.dp, EmeraldBorder, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = s.submixHiResBadge(remoteSubmixProfile.maxSupportedRate),
+                        color = EmeraldLive,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        style = TightTextStyle
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -615,14 +732,20 @@ private fun AudioBridgeConsoleCard(
     s: UsbBridgeStrings,
     shizukuState: ShizukuConnectionState,
     operatingMode: BridgeOperatingMode,
+    captureScopeMode: CaptureScopeMode,
+    selectedApp: InstalledAudioApp?,
+    trackedPlayer: ResolvedUidApp?,
+    preferredLaunchLabel: String?,
     manualSampleRate: Int,
     systemMusicVolume: SystemVolumeState,
     connectionState: DacConnectionState,
-    bridgeState: AppleMusicBridgeState,
+    bridgeState: AudioBridgeState,
     snifferStatus: SnifferStatus,
     telemetry: StreamTelemetry,
     preferredBitDepth: Int,
     onSelectOperatingMode: (BridgeOperatingMode) -> Unit,
+    onSelectCaptureScopeMode: (CaptureScopeMode) -> Unit,
+    onOpenAppPicker: () -> Unit,
     onSelectManualSampleRate: (Int) -> Unit,
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
@@ -630,7 +753,7 @@ private fun AudioBridgeConsoleCard(
     onStartBridge: () -> Unit,
     onStopBridge: () -> Unit,
     onQuickResync: () -> Unit,
-    onOpenAppleMusic: () -> Unit
+    onOpenPlayerOrPicker: () -> Unit
 ) {
     SectionCard {
         Row(
@@ -650,7 +773,33 @@ private fun AudioBridgeConsoleCard(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Equal 2-way Operating Mode Segmented Bar
+        // 1. Capture Scope 2-Way Segmented Bar (Global Auto vs Single App Lock)
+        SegmentedRow(
+            options = listOf(s.scopeGlobalTab, s.scopeSingleTab),
+            selectedIndex = if (captureScopeMode == CaptureScopeMode.SINGLE_APP) 1 else 0,
+            onSelect = { idx ->
+                onSelectCaptureScopeMode(
+                    if (idx == 1) CaptureScopeMode.SINGLE_APP else CaptureScopeMode.GLOBAL_MEDIA
+                )
+            },
+            height = 36.dp
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Active / Locked Player Telemetry & Picker Strip
+        PlayerScopeStrip(
+            s = s,
+            captureScopeMode = captureScopeMode,
+            selectedApp = selectedApp,
+            trackedPlayer = trackedPlayer,
+            bridgeState = bridgeState,
+            onOpenAppPicker = onOpenAppPicker
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // 2. Operating Mode 2-Way Segmented Bar (Manual vs Shizuku Auto)
         SegmentedRow(
             options = listOf(s.modeManualTab, s.modeShizukuTab),
             selectedIndex = if (operatingMode == BridgeOperatingMode.SHIZUKU_AUTO) 1 else 0,
@@ -695,7 +844,8 @@ private fun AudioBridgeConsoleCard(
             }
             val shizukuSub = if (shizukuState.isReady) {
                 if (snifferStatus.running) {
-                    s.shizukuActiveHint(snifferStatus.lastDetectedSpec?.sampleRate)
+                    val detected = snifferStatus.lastDetectedSpec
+                    s.shizukuActiveHint(detected?.appLabel, detected?.sampleRate)
                 } else {
                     s.shizukuIdleHint
                 }
@@ -850,6 +1000,8 @@ private fun AudioBridgeConsoleCard(
             else -> "-- kHz"
         }
         val dacSubText = when {
+            bridgeState.ratePlan != null && bridgeState.ratePlan.isHiResSubmixNative ->
+                s.tileDacHiResNative(preferredBitDepth)
             bridgeState.ratePlan != null && bridgeState.ratePlan.isIntegerDownsampled ->
                 s.tileDacIntDiv(bridgeState.ratePlan.integerDivisor, preferredBitDepth)
             bridgeState.active ->
@@ -907,11 +1059,13 @@ private fun AudioBridgeConsoleCard(
                 val srcKhz = formatKhz(plan.sourceSampleRate)
                 val effKhz = formatKhz(plan.effectiveSampleRate)
                 val fmt = bridgeState.dacHardware?.shortFormatTag ?: "S${preferredBitDepth}"
-                if (plan.isIntegerDownsampled) {
-                    s.pathSummaryIntDiv(srcKhz, effKhz, plan.integerDivisor, fmt)
-                } else {
-                    s.pathSummaryZeroSrc(srcKhz, effKhz, fmt)
+                val appTag = bridgeState.sourceSpec?.appLabel?.takeIf { it.isNotBlank() }?.let { "$it · " } ?: ""
+                val pathBody = when {
+                    plan.isHiResSubmixNative -> s.pathSummaryHiResNative(srcKhz, effKhz, fmt)
+                    plan.isIntegerDownsampled -> s.pathSummaryIntDiv(srcKhz, effKhz, plan.integerDivisor, fmt)
+                    else -> s.pathSummaryZeroSrc(srcKhz, effKhz, fmt)
                 }
+                appTag + pathBody
             }
             bridgeState.active ->
                 if (operatingMode == BridgeOperatingMode.SHIZUKU_AUTO) s.statusStreamingAuto else s.statusStreamingManual
@@ -951,9 +1105,14 @@ private fun AudioBridgeConsoleCard(
                 )
             }
 
+            val launchBtnLabel = if (!preferredLaunchLabel.isNullOrBlank()) {
+                s.btnOpenPlayerNamed(preferredLaunchLabel)
+            } else {
+                s.btnOpenPlayerDefault
+            }
             UniformButton(
-                text = s.btnOpenAppleMusic,
-                onClick = onOpenAppleMusic,
+                text = launchBtnLabel,
+                onClick = onOpenPlayerOrPicker,
                 height = 46.dp,
                 style = BtnStyle.Secondary,
                 modifier = Modifier.weight(1f)
@@ -969,6 +1128,433 @@ private fun AudioBridgeConsoleCard(
                 style = BtnStyle.Ghost,
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+    }
+}
+
+@Composable
+private fun PlayerScopeStrip(
+    s: UsbBridgeStrings,
+    captureScopeMode: CaptureScopeMode,
+    selectedApp: InstalledAudioApp?,
+    trackedPlayer: ResolvedUidApp?,
+    bridgeState: AudioBridgeState,
+    onOpenAppPicker: () -> Unit
+) {
+    if (captureScopeMode == CaptureScopeMode.SINGLE_APP) {
+        val borderColor = if (selectedApp != null) CyanBorder.copy(alpha = 0.7f) else AmberBorder
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(TileBg)
+                .border(1.dp, borderColor, RoundedCornerShape(12.dp))
+                .clickable(onClick = onOpenAppPicker)
+                .padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            AppIconBadge(icon = selectedApp?.icon, fallbackText = selectedApp?.label?.take(1) ?: "?")
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                if (selectedApp != null) {
+                    Text(
+                        text = selectedApp.label,
+                        color = TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 17.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = s.scopeSingleLockedSub(selectedApp.packageName, selectedApp.uid),
+                        color = TextSecondary,
+                        fontSize = 10.5.sp,
+                        lineHeight = 14.sp,
+                        style = TightTextStyle
+                    )
+                } else {
+                    Text(
+                        text = s.scopeSingleUnsetTitle,
+                        color = AmberWarn,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 16.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = s.scopeSingleUnsetSub,
+                        color = TextSecondary,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        style = TightTextStyle
+                    )
+                }
+            }
+            UniformButton(
+                text = if (selectedApp != null) s.btnChangeApp else s.btnPickApp,
+                onClick = onOpenAppPicker,
+                height = 32.dp,
+                style = if (selectedApp != null) BtnStyle.Secondary else BtnStyle.Primary,
+                modifier = Modifier.width(78.dp)
+            )
+        }
+    } else {
+        val activeTracked = trackedPlayer
+        val liveRateText = if (bridgeState.active && bridgeState.ratePlan != null) {
+            val plan = bridgeState.ratePlan
+            val src = formatKhz(plan.sourceSampleRate)
+            val eff = formatKhz(plan.effectiveSampleRate)
+            if (plan.sourceSampleRate != plan.effectiveSampleRate) "$src -> $eff" else eff
+        } else {
+            bridgeState.sourceSpec?.sampleRate?.takeIf { it > 0 }?.let { formatKhz(it) }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(TileBg)
+                .border(
+                    1.dp,
+                    if (activeTracked != null && bridgeState.active) EmeraldBorder.copy(alpha = 0.65f) else TileBorder,
+                    RoundedCornerShape(12.dp)
+                )
+                .padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            if (activeTracked != null) {
+                AppIconBadge(icon = activeTracked.icon, fallbackText = activeTracked.label.take(1))
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = s.scopeTrackingTitle(activeTracked.label, liveRateText),
+                        color = EmeraldLive,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 16.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = s.scopeTrackingSub(activeTracked.packageName),
+                        color = TextSecondary,
+                        fontSize = 10.5.sp,
+                        lineHeight = 14.sp,
+                        style = TightTextStyle
+                    )
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(CyanDimBg)
+                        .border(1.dp, CyanBorder.copy(alpha = 0.6f), RoundedCornerShape(8.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "ALL",
+                        color = CyanPrimary,
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        style = TightTextStyle
+                    )
+                }
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = s.scopeGlobalIdleTitle,
+                        color = TextPrimary,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 16.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = s.scopeGlobalIdleSub,
+                        color = TextSecondary,
+                        fontSize = 10.5.sp,
+                        lineHeight = 14.5.sp,
+                        style = TightTextStyle
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppIconBadge(
+    icon: ImageBitmap?,
+    fallbackText: String,
+    size: Dp = 32.dp
+) {
+    if (icon != null) {
+        Image(
+            bitmap = icon,
+            contentDescription = null,
+            modifier = Modifier
+                .size(size)
+                .clip(RoundedCornerShape(8.dp))
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .clip(RoundedCornerShape(8.dp))
+                .background(CyanDimBg)
+                .border(1.dp, CyanBorder.copy(alpha = 0.5f), RoundedCornerShape(8.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = fallbackText.uppercase(),
+                color = CyanPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                style = TightTextStyle
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppPickerDialog(
+    s: UsbBridgeStrings,
+    installedApps: List<InstalledAudioApp>,
+    selectedPackageName: String?,
+    isScanning: Boolean,
+    onRefresh: () -> Unit,
+    onSelectApp: (InstalledAudioApp) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+
+    val filtered = remember(installedApps, query) {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) installedApps
+        else installedApps.filter { app ->
+            app.label.lowercase().contains(q) || app.packageName.lowercase().contains(q)
+        }
+    }
+    val audioApps = remember(filtered) { filtered.filter { it.isRecommendedAudio } }
+    val otherApps = remember(filtered) { filtered.filter { !it.isRecommendedAudio } }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .heightIn(min = 320.dp, max = 600.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(CardBg)
+                .border(1.dp, CardBorder, RoundedCornerShape(18.dp))
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = s.pickerTitle,
+                    color = TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    style = TightTextStyle,
+                    modifier = Modifier.weight(1f)
+                )
+                UniformButton(
+                    text = s.btnRefresh,
+                    onClick = onRefresh,
+                    enabled = !isScanning,
+                    height = 30.dp,
+                    style = BtnStyle.Ghost,
+                    modifier = Modifier.width(64.dp)
+                )
+                UniformButton(
+                    text = s.pickerClose,
+                    onClick = onDismiss,
+                    height = 30.dp,
+                    style = BtnStyle.Secondary,
+                    modifier = Modifier.width(64.dp)
+                )
+            }
+
+            // Search box (searches by app name OR package name)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(TileBg)
+                    .border(1.dp, CyanBorder.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                if (query.isEmpty()) {
+                    Text(
+                        text = s.pickerSearchHint,
+                        color = TextMuted,
+                        fontSize = 12.sp,
+                        style = TightTextStyle
+                    )
+                }
+                BasicTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    singleLine = true,
+                    cursorBrush = SolidColor(CyanPrimary),
+                    textStyle = TextStyle(
+                        color = TextPrimary,
+                        fontSize = 13.sp,
+                        platformStyle = PlatformTextStyle(includeFontPadding = false)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(TileBg)
+                    .border(1.dp, TileBorder, RoundedCornerShape(12.dp))
+                    .padding(6.dp)
+            ) {
+                when {
+                    isScanning && installedApps.isEmpty() -> {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(s.pickerScanning, color = TextSecondary, fontSize = 12.5.sp, style = TightTextStyle)
+                        }
+                    }
+                    filtered.isEmpty() -> {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(s.pickerEmpty, color = TextMuted, fontSize = 12.5.sp, style = TightTextStyle)
+                        }
+                    }
+                    else -> {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            if (audioApps.isNotEmpty()) {
+                                item(key = "hdr_audio") {
+                                    Text(
+                                        text = s.pickerSectionAudio(audioApps.size),
+                                        color = CyanPrimary,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = TightTextStyle,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                                    )
+                                }
+                                items(audioApps, key = { "a_${it.packageName}" }) { app ->
+                                    AppPickerRow(
+                                        app = app,
+                                        selected = app.packageName == selectedPackageName,
+                                        selectedBadge = s.pickerSelectedBadge,
+                                        onClick = { onSelectApp(app) }
+                                    )
+                                }
+                            }
+                            if (otherApps.isNotEmpty()) {
+                                item(key = "hdr_other") {
+                                    Text(
+                                        text = s.pickerSectionAll(otherApps.size),
+                                        color = TextMuted,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = TightTextStyle,
+                                        modifier = Modifier.padding(
+                                            start = 6.dp,
+                                            end = 6.dp,
+                                            top = if (audioApps.isNotEmpty()) 8.dp else 4.dp,
+                                            bottom = 4.dp
+                                        )
+                                    )
+                                }
+                                items(otherApps, key = { "o_${it.packageName}" }) { app ->
+                                    AppPickerRow(
+                                        app = app,
+                                        selected = app.packageName == selectedPackageName,
+                                        selectedBadge = s.pickerSelectedBadge,
+                                        onClick = { onSelectApp(app) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppPickerRow(
+    app: InstalledAudioApp,
+    selected: Boolean,
+    selectedBadge: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) CyanDimBg else CardBg)
+            .border(1.dp, if (selected) CyanBorder else TileBorder, RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        AppIconBadge(icon = app.icon, fallbackText = app.label.take(1), size = 34.dp)
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = app.label,
+                color = if (selected) CyanPrimary else TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                lineHeight = 17.sp,
+                style = TightTextStyle
+            )
+            Text(
+                text = app.packageName,
+                color = TextMuted,
+                fontSize = 10.5.sp,
+                lineHeight = 14.sp,
+                fontFamily = FontFamily.Monospace,
+                style = TightTextStyle
+            )
+        }
+        if (selected) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(EmeraldDimBg)
+                    .border(1.dp, EmeraldBorder, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = selectedBadge,
+                    color = EmeraldLive,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    style = TightTextStyle
+                )
+            }
         }
     }
 }
@@ -1122,8 +1708,12 @@ private fun GainAndBufferCard(
                 style = TightTextStyle
             )
             Text(
-                text = s.spscTargetHint(bufferDurationMs),
-                color = TextMuted,
+                text = if (bufferDurationMs <= 85) {
+                    s.spscLowLatencyHint(bufferDurationMs)
+                } else {
+                    s.spscTargetHint(bufferDurationMs)
+                },
+                color = if (bufferDurationMs <= 85) EmeraldLive else TextMuted,
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace,
                 style = TightTextStyle
@@ -1150,6 +1740,8 @@ private fun GainAndBufferCard(
 private fun WorkbenchCard(
     s: UsbBridgeStrings,
     languagePref: LanguagePref,
+    socProfile: SocCompatibilityProfile,
+    remoteSubmixProfile: RemoteSubmixProfile?,
     onSelectLanguagePref: (LanguagePref) -> Unit,
     activeTab: Int,
     onSelectTab: (Int) -> Unit,
@@ -1314,6 +1906,53 @@ private fun WorkbenchCard(
                     },
                     height = 36.dp
                 )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Detected SoC & HAL Strategy Box
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(TileBg)
+                        .border(1.dp, TileBorder, RoundedCornerShape(10.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = s.socCardLabel,
+                        color = TextMuted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = "${socProfile.deviceModel} · ${socProfile.socDisplayName} (${socProfile.rawBoardPlatform})",
+                        color = CyanPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 16.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = socProfile.strategyDescription(s.isZh),
+                        color = TextSecondary,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        style = TightTextStyle
+                    )
+                    Text(
+                        text = if (remoteSubmixProfile != null) {
+                            s.socSubmixLine(remoteSubmixProfile.rawSummary)
+                        } else {
+                            s.socSubmixDefault
+                        },
+                        color = TextMuted,
+                        fontSize = 10.5.sp,
+                        lineHeight = 14.5.sp,
+                        style = TightTextStyle
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(12.dp))
 

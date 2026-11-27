@@ -252,11 +252,10 @@ JNIEXPORT void JNICALL
 Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeClose(
     JNIEnv* /*env*/,
     jobject /*thiz*/,
-    jboolean restoreUnityVolume,
-    jboolean resetUsbPort
+    jboolean restoreUnityVolume
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
-    globalEngine().close(restoreUnityVolume == JNI_TRUE, resetUsbPort == JNI_TRUE);
+    globalEngine().close(restoreUnityVolume == JNI_TRUE);
 }
 
 JNIEXPORT jstring JNICALL

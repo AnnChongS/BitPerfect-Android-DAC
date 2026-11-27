@@ -39,17 +39,17 @@ void configureRealtimeAudioThread(int tid) {
         return;
     }
 
-    // Immediate fallback while Kotlin Root daemon executes `chrt -f -p <tid> 50`
+    // Standard Zero-Root urgent nice priority
     int targets[] = {-19, -16, -10};
     for (int niceVal : targets) {
         if (setpriority(PRIO_PROCESS, 0, niceVal) == 0) {
-            BP_LOGI("USB ISO thread (tid=%d) initial scheduling: nice=%d (requesting Root SCHED_FIFO prio=50)",
+            BP_LOGI("USB ISO thread (tid=%d) scheduling: nice=%d (urgent audio priority)",
                     tid, niceVal);
             return;
         }
     }
     int actual = getpriority(PRIO_PROCESS, 0);
-    BP_LOGW("USB ISO thread (tid=%d) initial nice=%d (requesting Root SCHED_FIFO prio=50)", tid, actual);
+    BP_LOGW("USB ISO thread (tid=%d) scheduling: nice=%d", tid, actual);
 }
 
 } // namespace
@@ -102,18 +102,25 @@ bool UsbIsoStreamer::start(
         useFeedback_
     );
 
-    // Choose 32 microframes/URB on HS bInterval=1 (4.0ms/URB -> 12 URBs = 48ms in-flight xHCI DMA)
-    // to absorb Android background scheduling jitter with half the ioctl overhead.
+    // Adaptive URB sizing:
+    //  - Low-latency rhythm-game mode (target <= 85ms): 2.0ms/URB (12 URBs = 24ms xHCI DMA ring)
+    //  - Hi-Fi mode (target > 85ms): 4.0ms/URB (12 URBs = 48ms xHCI DMA ring, half ioctl overhead)
+    const double targetMs = (sampleRate_ > 0 && frameBytes_ > 0)
+        ? (1000.0 * static_cast<double>(targetBufferBytes)) /
+          (static_cast<double>(sampleRate_) * static_cast<double>(frameBytes_))
+        : 250.0;
+    const bool lowLatencyMode = (targetMs <= 85.0);
+
     if (pacer_.isHighSpeed()) {
         if (pacer_.intervalsPerSec() >= 8000u) {
-            numIsoPacketsPerUrb_ = 32; // 4.0 ms per URB (12 URBs = 48.0 ms hardware ring)
+            numIsoPacketsPerUrb_ = lowLatencyMode ? 16 : 32; // 2.0ms or 4.0ms per URB
         } else if (pacer_.intervalsPerSec() >= 4000u) {
-            numIsoPacketsPerUrb_ = 16; // 4.0 ms per URB
+            numIsoPacketsPerUrb_ = lowLatencyMode ? 8 : 16;
         } else {
-            numIsoPacketsPerUrb_ = 8;
+            numIsoPacketsPerUrb_ = lowLatencyMode ? 4 : 8;
         }
     } else {
-        numIsoPacketsPerUrb_ = 4; // 4.0 ms per URB on Full-Speed
+        numIsoPacketsPerUrb_ = lowLatencyMode ? 2 : 4; // 2.0ms or 4.0ms per URB on Full-Speed
     }
 
     packetsSubmitted_.store(0, std::memory_order_relaxed);

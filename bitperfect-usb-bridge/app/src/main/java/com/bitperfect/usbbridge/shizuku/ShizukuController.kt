@@ -246,10 +246,20 @@ class ShizukuController(
         return runCatching { svc.dumpAudioPolicySubmix() }.getOrNull()
     }
 
-    fun applyBackgroundKeepAlive(): String? {
+    fun applyBackgroundKeepAlive(extraPackages: List<String> = emptyList()): String? {
         val svc = activeService() ?: return null
+        val csv = buildList {
+            add(appContext.packageName)
+            extraPackages.forEach { pkg ->
+                val clean = pkg.trim()
+                if (clean.isNotEmpty() && clean != appContext.packageName) {
+                    add(clean)
+                }
+            }
+        }.distinct().take(6).joinToString(",")
+
         return runCatching {
-            val res = svc.applyBackgroundKeepAlive(appContext.packageName)
+            val res = svc.applyBackgroundKeepAlive(csv)
             onLog(1, "Shizuku 后台保活已下发: $res")
             res
         }.onFailure { e ->
