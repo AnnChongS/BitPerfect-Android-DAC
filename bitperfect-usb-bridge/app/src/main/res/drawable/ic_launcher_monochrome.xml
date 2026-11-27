@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer crystal clock ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.2"
+        android:pathData="M54,24A30,30 0 1,1 54,84A30,30 0 1,1 54,24z" />
+    <!-- USB Type-C precision pill bezel -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.2"
+        android:pathData="M36,42L72,42A12,12 0 0,1 84,54A12,12 0 0,1 72,66L36,66A12,12 0 0,1 24,54A12,12 0 0,1 36,42z" />
+    <!-- Digital step-to-sine waveform pulse -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M31,54L38,54L38,58L43,58L43,49L48,49L48,59L51,59L55,46L60,61L64,54L77,54" />
+</vector>

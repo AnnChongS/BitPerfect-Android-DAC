@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BitPerfect Root DAC</string>
+    <string name="notif_channel_name">BitPerfect Root DAC Service</string>
+    <string name="notif_channel_desc">Maintains exclusive libusb DAC connection and native Apple Music Bit-Perfect stream</string>
+    <string name="notif_action_release">Release DAC</string>
+    <string name="xposed_description">Native 24-bit/192kHz in-process AudioTrack Bit-Perfect bridge for Apple Music (bypasses Android AudioFlinger and 48kHz r_submix cap)</string>
+</resources>

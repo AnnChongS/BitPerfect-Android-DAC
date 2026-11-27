@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BitPerfect USB Bridge</string>
+    <string name="notif_channel_name">USB DAC Audio Bridge</string>
+    <string name="notif_channel_desc">Maintains exclusive libusb connection to external USB DAC</string>
+    <string name="notif_action_release">Release DAC</string>
+</resources>

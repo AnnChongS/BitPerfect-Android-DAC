@@ -1,0 +1,22 @@
+# Gradle & IDE build outputs
+.gradle/
+.kotlin/
+.idea/
+*.iml
+build/
+app/build/
+app/.cxx/
+.externalNativeBuild/
+.cxx/
+captures/
+.DS_Store
+
+# Machine-specific SDK paths & private signing keys (NEVER commit)
+local.properties
+keystore/
+keystore.properties
+*.jks
+*.keystore
+
+# Upstream libusb v1.0.27 is automatically fetched by CMake FetchContent
+app/src/main/cpp/third_party/libusb/

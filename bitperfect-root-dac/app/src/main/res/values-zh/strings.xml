@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BitPerfect Root DAC</string>
+    <string name="notif_channel_name">BitPerfect Root DAC 独占音频服务</string>
+    <string name="notif_channel_desc">保持外接 USB 解码耳放独占连接与 Apple Music 192kHz 源码直通后台运行</string>
+    <string name="notif_action_release">释放 DAC</string>
+    <string name="xposed_description">Apple Music 24-bit/192kHz 进程内无损源码直截引擎 (绕过 Android r_submix 48kHz 上限与 AudioFlinger)</string>
+</resources>

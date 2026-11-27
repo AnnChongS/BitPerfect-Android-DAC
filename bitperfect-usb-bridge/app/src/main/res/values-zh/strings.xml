@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BitPerfect USB Bridge</string>
+    <string name="notif_channel_name">USB 解码耳放直通服务</string>
+    <string name="notif_channel_desc">保持外接 USB 解码耳放的底层独占音频传输</string>
+    <string name="notif_action_release">释放 DAC</string>
+</resources>
