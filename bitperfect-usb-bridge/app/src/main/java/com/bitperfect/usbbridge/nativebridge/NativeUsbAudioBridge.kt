@@ -123,12 +123,15 @@ object NativeUsbAudioBridge {
 
     private external fun nativeGetIsoThreadTid(): Int
 
+    private external fun nativeSetTraceFilePath(path: String)
+
     private external fun nativeOpenAndInspect(
         fd: Int,
         vendorId: Int,
         productId: Int,
         fallbackName: String,
-        initialVolumeDb: Double
+        initialVolumeDb: Double,
+        isQualcommPlatform: Boolean
     ): String
 
     private external fun nativeGetLastReport(): String
@@ -165,19 +168,25 @@ object NativeUsbAudioBridge {
         return nativeGetIsoThreadTid()
     }
 
+    fun setTraceFilePath(path: String) {
+        nativeSetTraceFilePath(path)
+    }
+
     fun openAndInspect(
         fd: Int,
         vendorId: Int,
         productId: Int,
         fallbackName: String,
-        initialVolumeDb: Double = 0.0
+        initialVolumeDb: Double = 0.0,
+        isQualcommPlatform: Boolean = false
     ): InspectResult {
         val rawJson = nativeOpenAndInspect(
             fd,
             vendorId,
             productId,
             fallbackName,
-            initialVolumeDb
+            initialVolumeDb,
+            isQualcommPlatform
         )
         return try {
             val root = JSONObject(rawJson)

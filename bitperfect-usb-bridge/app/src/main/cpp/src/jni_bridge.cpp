@@ -188,6 +188,23 @@ Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeGetIsoThre
     return static_cast<jint>(globalEngine().getIsoThreadTid());
 }
 
+JNIEXPORT void JNICALL
+Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeSetTraceFilePath(
+    JNIEnv* env,
+    jobject /*thiz*/,
+    jstring path
+) {
+    std::string pathStr;
+    if (path) {
+        const char* chars = env->GetStringUTFChars(path, nullptr);
+        if (chars) {
+            pathStr = chars;
+            env->ReleaseStringUTFChars(path, chars);
+        }
+    }
+    globalEngine().setTraceFilePath(pathStr);
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeOpenAndInspect(
     JNIEnv* env,
@@ -196,7 +213,8 @@ Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeOpenAndIns
     jint vendorId,
     jint productId,
     jstring fallbackName,
-    jdouble initialVolumeDb
+    jdouble initialVolumeDb,
+    jboolean isQualcommPlatform
 ) {
     std::string nameStr;
     if (fallbackName) {
@@ -220,6 +238,7 @@ Java_com_bitperfect_usbbridge_nativebridge_NativeUsbAudioBridge_nativeOpenAndIns
         static_cast<uint16_t>(productId),
         nameStr,
         static_cast<double>(initialVolumeDb),
+        isQualcommPlatform == JNI_TRUE,
         report,
         profileJson,
         error

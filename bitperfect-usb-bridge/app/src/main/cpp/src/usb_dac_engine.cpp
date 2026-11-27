@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fcntl.h>
 #include <iomanip>
 #include <libusb.h>
 #include <set>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 
 namespace bitperfect {
 
@@ -41,6 +43,26 @@ bool altSupportsRate(const uac::AudioStreamAltSetting& alt, uint32_t sampleRate)
 
 UsbDacEngine::~UsbDacEngine() {
     close();
+}
+
+void UsbDacEngine::setTraceFilePath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    traceFilePath_ = path;
+}
+
+void UsbDacEngine::writeTrace(const std::string& step, bool truncate) const {
+    if (traceFilePath_.empty()) return;
+    int flags = O_WRONLY | O_CREAT | (truncate ? O_TRUNC : O_APPEND);
+    int fd = ::open(traceFilePath_.c_str(), flags, 0600);
+    if (fd < 0) return;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+    std::string line = std::to_string(ms) + " " + step + "\n";
+    ssize_t ignored = ::write(fd, line.data(), line.size());
+    (void)ignored;
+    ::fsync(fd);
+    ::close(fd);
 }
 
 bool UsbDacEngine::initLibusbContext(std::string& outError) {
@@ -142,15 +164,102 @@ void UsbDacEngine::claimAudioInterfacesLocked() {
     }
     libusb_free_config_descriptor(config);
 
-    // Stage 1: Detach & claim ONLY Playback AudioStreaming interface(s) (e.g. IF#2) FIRST!
+    if (!isQualcommPlatform_) {
+        // Universal Offload-Safe Detach Sequence (Xiaomi XRING O1 / Exynos / MediaTek / Tensor / Generic ARM):
+        //  1. Detach primary AudioControl IF#0 FIRST so snd-usb-audio / xring_usb_adsp_v1 / mtk-usb-offload
+        //     cleanly executes usb_audio_disconnect() and exits ADSP offload mode atomically.
+        //  2. Wait 50ms for kernel offload teardown to settle.
+        //  3. Detach any still-attached sibling Capture/Playback interfaces (never leaving offload half-bound).
+        //  4. Claim IF#0 & Playback IF#2 cleanly with ZERO Stage-1 ISO warmup and ZERO illegal clear_halt!
+        for (int acIf : controlIfaces) {
+            writeTrace("ENTER kernel_driver_active(AC IF#" + std::to_string(acIf) + ")");
+            int active = libusb_kernel_driver_active(handle_, acIf);
+            writeTrace("OK kernel_driver_active(AC IF#" + std::to_string(acIf) + ")=" + std::to_string(active));
+            if (active == 1) {
+                writeTrace("ENTER detach_kernel_driver(AC IF#" + std::to_string(acIf) + ")");
+                int detachRc = libusb_detach_kernel_driver(handle_, acIf);
+                writeTrace("OK detach_kernel_driver(AC IF#" + std::to_string(acIf) + ")=" + libusb_error_name(detachRc));
+                BP_LOGI("[Universal-1] libusb_detach_kernel_driver(AudioControl IF#%d) -> %s",
+                        acIf, libusb_error_name(detachRc));
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Verify sibling Capture/Mic interfaces were released by usb_audio_disconnect(); detach if still active
+        for (int micIf : captureStreamIfaces) {
+            int active = libusb_kernel_driver_active(handle_, micIf);
+            BP_LOGI("[Universal-2] Capture IF#%d kernel_driver_active=%d (after IF#0 detach)", micIf, active);
+            if (active == 1) {
+                writeTrace("ENTER detach_kernel_driver(Mic IF#" + std::to_string(micIf) + ")");
+                int detachRc = libusb_detach_kernel_driver(handle_, micIf);
+                writeTrace("OK detach_kernel_driver(Mic IF#" + std::to_string(micIf) + ")=" + libusb_error_name(detachRc));
+                BP_LOGI("[Universal-2] libusb_detach_kernel_driver(Mic IF#%d) -> %s",
+                        micIf, libusb_error_name(detachRc));
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+        }
+
+        // Verify & detach Playback interfaces if still kernel-bound
+        for (int ifNum : playbackStreamIfaces) {
+            int active = libusb_kernel_driver_active(handle_, ifNum);
+            BP_LOGI("[Universal-2] Playback IF#%d kernel_driver_active=%d (after IF#0 detach)", ifNum, active);
+            if (active == 1) {
+                writeTrace("ENTER detach_kernel_driver(Playback IF#" + std::to_string(ifNum) + ")");
+                int detachRc = libusb_detach_kernel_driver(handle_, ifNum);
+                writeTrace("OK detach_kernel_driver(Playback IF#" + std::to_string(ifNum) + ")=" + libusb_error_name(detachRc));
+                BP_LOGI("[Universal-2] libusb_detach_kernel_driver(Playback IF#%d) -> %s",
+                        ifNum, libusb_error_name(detachRc));
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+        }
+
+        // Claim AudioControl IF#0 then Playback IF#2 (pure interface claim — ZERO ISO traffic during inspect!)
+        for (int acIf : controlIfaces) {
+            writeTrace("ENTER claim_interface(AC IF#" + std::to_string(acIf) + ")");
+            int claimRc = libusb_claim_interface(handle_, acIf);
+            writeTrace("OK claim_interface(AC IF#" + std::to_string(acIf) + ")=" + libusb_error_name(claimRc));
+            if (claimRc == LIBUSB_SUCCESS) {
+                claimedInterfaces_.push_back(acIf);
+                BP_LOGI("[Universal-3] libusb claimed AudioControl IF#%d successfully", acIf);
+            } else {
+                BP_LOGW("[Universal-3] libusb_claim_interface(AudioControl IF#%d) returned %s",
+                        acIf, libusb_error_name(claimRc));
+            }
+        }
+
+        if (!controlIfaces.empty() && !playbackStreamIfaces.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+
+        for (int ifNum : playbackStreamIfaces) {
+            writeTrace("ENTER claim_interface(Playback IF#" + std::to_string(ifNum) + ")");
+            int claimRc = libusb_claim_interface(handle_, ifNum);
+            writeTrace("OK claim_interface(Playback IF#" + std::to_string(ifNum) + ")=" + libusb_error_name(claimRc));
+            if (claimRc == LIBUSB_SUCCESS) {
+                claimedInterfaces_.push_back(ifNum);
+                BP_LOGI("[Universal-3] libusb claimed Playback IF#%d successfully (跳过 Stage-1 ISO 预握手)", ifNum);
+            } else {
+                BP_LOGW("[Universal-3] libusb_claim_interface(Playback IF#%d) returned %s",
+                        ifNum, libusb_error_name(claimRc));
+            }
+        }
+        return;
+    }
+
+    // Qualcomm Snapdragon Stage 1: Detach & claim ONLY Playback AudioStreaming interface(s) (e.g. IF#2) FIRST!
     for (int ifNum : playbackStreamIfaces) {
         int active = libusb_kernel_driver_active(handle_, ifNum);
         if (active == 1) {
+            writeTrace("ENTER qcom_detach(Playback IF#" + std::to_string(ifNum) + ")");
             int detachRc = libusb_detach_kernel_driver(handle_, ifNum);
+            writeTrace("OK qcom_detach(Playback IF#" + std::to_string(ifNum) + ")=" + libusb_error_name(detachRc));
             BP_LOGI("[Stage-1] libusb_detach_kernel_driver(Playback IF#%d) -> %s",
                     ifNum, libusb_error_name(detachRc));
         }
+        writeTrace("ENTER qcom_claim(Playback IF#" + std::to_string(ifNum) + ")");
         int claimRc = libusb_claim_interface(handle_, ifNum);
+        writeTrace("OK qcom_claim(Playback IF#" + std::to_string(ifNum) + ")=" + libusb_error_name(claimRc));
         if (claimRc == LIBUSB_SUCCESS) {
             claimedInterfaces_.push_back(ifNum);
             BP_LOGI("[Stage-1] libusb claimed Playback IF#%d successfully", ifNum);
@@ -160,11 +269,10 @@ void UsbDacEngine::claimAudioInterfacesLocked() {
         }
     }
 
-    // Automatic Stage-1 silent ISO warm-up while IF#0 is STILL untouched (reproduces the smooth IF#2-first state!)
+    // Qualcomm-only Stage-1 silent ISO warm-up (WITHOUT illegal libusb_clear_halt on ISO endpoint!)
     if (ctx_ && warmupIfNum >= 0 && warmupAltNum > 0 && warmupEpAddr != 0 && warmupMaxPkt > 0) {
         int rcAlt = libusb_set_interface_alt_setting(handle_, warmupIfNum, warmupAltNum);
         if (rcAlt == LIBUSB_SUCCESS) {
-            libusb_clear_halt(handle_, warmupEpAddr);
             constexpr int kWarmupPkts = 32; // 4ms at High-Speed bInterval=1
             const int pktBytes = std::min<int>(static_cast<int>(warmupMaxPkt), 192);
             std::vector<uint8_t> zeroBuf(static_cast<size_t>(kWarmupPkts * pktBytes), 0u);
@@ -201,14 +309,11 @@ void UsbDacEngine::claimAudioInterfacesLocked() {
         }
     }
 
-    // Cross-SoC USB host settle delay (Qualcomm xHCI / XRING / MediaTek MUSB-xHCI / Samsung Exynos):
-    // Give the kernel usb_audio_disconnect() & host controller 15ms to settle before detaching IF#0.
     if (!playbackStreamIfaces.empty() && !controlIfaces.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
 
-    // Stage 2: Detach & claim AudioControl IF#0 ONLY
-    // (Capture/Mic IF#1 is NEVER touched so ADC clocks & mtk-usb-offload/exynos capture IRQs stay undisturbed!)
+    // Qualcomm Stage 2: Detach & claim AudioControl IF#0 ONLY
     for (int acIf : controlIfaces) {
         int active = libusb_kernel_driver_active(handle_, acIf);
         if (active == 1) {
@@ -227,7 +332,7 @@ void UsbDacEngine::claimAudioInterfacesLocked() {
     }
 
     for (int micIf : captureStreamIfaces) {
-        BP_LOGI("[Stage-2] 跳过麦克风接口 IF#%d (保持不剥离，避免干扰 ADC ClockSource #27)", micIf);
+        BP_LOGI("[Stage-2] 跳过麦克风接口 IF#%d (高通模式保持不剥离，隔离 ADC ClockSource)", micIf);
     }
 }
 
@@ -250,6 +355,7 @@ bool UsbDacEngine::openAndInspect(
     uint16_t fallbackPid,
     const std::string& fallbackName,
     double initialVolumeDb,
+    bool isQualcommPlatform,
     std::string& outReport,
     std::string& outProfileJson,
     std::string& outError
@@ -257,35 +363,51 @@ bool UsbDacEngine::openAndInspect(
     std::lock_guard<std::mutex> lock(mutex_);
     closeLocked(false);
 
+    isQualcommPlatform_ = isQualcommPlatform;
+    isoStreamer_.setTraceCallback([this](const char* msg) {
+        writeTrace(msg);
+    });
+    writeTrace(std::string("START openAndInspect fd=") + std::to_string(fd) +
+               " isQcom=" + (isQualcommPlatform_ ? "1" : "0"), true);
+
     if (fd < 0) {
         outError = "Invalid USB file descriptor (< 0)";
         BP_LOGE("%s", outError.c_str());
+        writeTrace("FAIL invalid_fd");
         return false;
     }
 
     if (!initLibusbContext(outError)) {
+        writeTrace("FAIL initLibusbContext");
         return false;
     }
 
-    BP_LOGI("Wrapping Android USB fd=%d via libusb_wrap_sys_device...", fd);
+    BP_LOGI("Wrapping Android USB fd=%d via libusb_wrap_sys_device (strategy=%s)...",
+            fd, isQualcommPlatform_ ? "Qualcomm-TwoStage" : "Universal-OffloadSafe");
+    writeTrace("ENTER libusb_wrap_sys_device");
     int rc = libusb_wrap_sys_device(ctx_, static_cast<intptr_t>(fd), &handle_);
     if (rc != LIBUSB_SUCCESS || !handle_) {
         outError = std::string("libusb_wrap_sys_device(fd=") + std::to_string(fd) +
                    ") failed: " + libusb_error_name(rc);
         BP_LOGE("%s", outError.c_str());
+        writeTrace("FAIL libusb_wrap_sys_device");
         closeLocked();
         return false;
     }
+    writeTrace("OK libusb_wrap_sys_device");
     BP_LOGI("libusb_wrap_sys_device succeeded (handle=%p)", static_cast<void*>(handle_));
 
     claimAudioInterfacesLocked();
 
+    writeTrace("ENTER UacParser::parseFromLibusbDevice");
     if (!uac::UacParser::parseFromLibusbDevice(
             handle_, fallbackVid, fallbackPid, fallbackName, profile_, outError)) {
         BP_LOGE("UAC descriptor parsing failed: %s", outError.c_str());
+        writeTrace("FAIL UacParser");
         closeLocked();
         return false;
     }
+    writeTrace("OK UacParser::parseFromLibusbDevice");
 
     isOpen_ = true;
     outReport = uac::UacParser::formatDiagnosticReport(profile_);
@@ -297,11 +419,16 @@ bool UsbDacEngine::openAndInspect(
         BP_LOGI("%s", line.c_str());
     }
 
-    // Ensure claimed AudioStreaming interfaces start cleanly in Alt#0 (zero-bandwidth idle)
-    resetAllStreamingInterfacesToAlt0Locked();
+    // On Qualcomm, ensure claimed AudioStreaming interfaces start in Alt#0.
+    // On non-Qualcomm SoCs (XRING/Exynos/MTK), freshly detached AS interfaces are already idle in Alt#0;
+    // avoid redundant SET_INTERFACE during pure descriptor inspection.
+    if (isQualcommPlatform_) {
+        resetAllStreamingInterfacesToAlt0Locked();
+    }
 
     // Initialize DAC hardware volume (uses saved user dB on rate-switch so volume never jumps to 0 dB!)
     if (profile_.hasPlaybackFeatureUnit) {
+        writeTrace("ENTER init_hardware_volume");
         unmuteFeatureUnitLocked();
         if (profile_.playbackFeatureUnit.masterVolume || profile_.playbackFeatureUnit.channelVolume) {
             std::string volErr;
@@ -311,8 +438,10 @@ bool UsbDacEngine::openAndInspect(
                 currentVolumeDb_.store(initialVolumeDb, std::memory_order_relaxed);
             }
         }
+        writeTrace("OK init_hardware_volume");
     }
 
+    writeTrace("DONE openAndInspect");
     return true;
 }
 
@@ -691,62 +820,76 @@ bool UsbDacEngine::configureHardwareLocked(
     std::string& outError
 ) {
     BP_LOGI("Configuring DAC hardware: IF#%d Alt#%d (%s, %uch) @ %u Hz "
-            "(strict UAC2 sequence: All AS Alt#0 -> ClockSelector/ClockSource -> clear_halt -> Alt#%d)",
+            "(USB 2.0 spec-strict UAC2 sequence: AS Alt#0 -> ClockSelector/ClockSource -> Alt#%d, zero clear_halt)",
             alt.interfaceNumber, alt.altSetting,
             uac::pcmFormatToString(alt.pcmFormat), alt.channels, sampleRate, alt.altSetting);
 
-    // Step 1: Force ALL AudioStreaming interfaces (e.g. IF#1 Capture & IF#2 Playback) into Alt#0 first!
+    writeTrace("ENTER configureHardware rate=" + std::to_string(sampleRate) +
+               " IF#" + std::to_string(alt.interfaceNumber) + " Alt#" + std::to_string(alt.altSetting));
+
+    // Step 1: Ensure AudioStreaming interface is in Alt#0 (zero-bandwidth idle) before programming UAC2 clock
+    writeTrace("ENTER resetAllStreamingInterfacesToAlt0");
     resetAllStreamingInterfacesToAlt0Locked();
+    writeTrace("OK resetAllStreamingInterfacesToAlt0");
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
     uint32_t verifiedRate = 0;
     if (alt.version == uac::UacVersion::Uac2) {
-        // Step 2 (strictly while in Alt#0!): Lock Clock Selector(s) + ClockSource #30 (+ CS#27 sync)
+        // Step 2 (strictly while in Alt#0!): Lock Clock Selector(s) + ClockSource
+        writeTrace("ENTER setUac2ClockRate");
         if (!setUac2ClockRateLocked(alt, sampleRate, verifiedRate, outError)) {
+            writeTrace("FAIL setUac2ClockRate");
             return false;
         }
+        writeTrace("OK setUac2ClockRate verified=" + std::to_string(verifiedRate));
 
-        // Step 3: Clear any stale endpoint HALT/toggle before activating Isochronous AltSetting
-        int rcHalt = libusb_clear_halt(handle_, alt.dataEndpointAddr);
-        BP_LOGI("libusb_clear_halt(EP 0x%02X) -> %s",
-                alt.dataEndpointAddr,
-                rcHalt == LIBUSB_SUCCESS ? "OK" : libusb_error_name(rcHalt));
+        // Note: NEVER call libusb_clear_halt() on Isochronous endpoints (USB 2.0 §5.6.4 forbids
+        // HALT on ISO endpoints; calling xhci_endpoint_reset while in Alt#0 deadlocks custom xHCI drivers!).
 
-        // Step 4 (FINAL step!): Activate Playback AltSetting AFTER clocks are locked so DAC latches
+        // Step 3: Activate Playback AltSetting AFTER clocks are locked so DAC latches
         // its internal digital oversampling filter & MCLK/BCLK/LRCK dividers at the exact target rate!
+        writeTrace("ENTER set_interface_alt_setting(IF#" + std::to_string(alt.interfaceNumber) +
+                   ", Alt#" + std::to_string(alt.altSetting) + ")");
         int rcAlt = libusb_set_interface_alt_setting(handle_, alt.interfaceNumber, alt.altSetting);
         if (rcAlt != LIBUSB_SUCCESS) {
             outError = std::string("libusb_set_interface_alt_setting(IF#") +
                        std::to_string(alt.interfaceNumber) + ", Alt#" +
                        std::to_string(alt.altSetting) + ") failed: " + libusb_error_name(rcAlt);
             BP_LOGE("%s", outError.c_str());
+            writeTrace("FAIL set_interface_alt_setting");
             return false;
         }
+        writeTrace("OK set_interface_alt_setting");
         BP_LOGI("Activated AudioStreaming IF#%d Alt#%d (%s) AFTER clock lock @ %u Hz",
                 alt.interfaceNumber, alt.altSetting, uac::pcmFormatToString(alt.pcmFormat), verifiedRate);
     } else {
         // UAC 1.0 sets sampling frequency on the active streaming endpoint
+        writeTrace("ENTER uac1_set_interface_alt_setting");
         int rcAlt = libusb_set_interface_alt_setting(handle_, alt.interfaceNumber, alt.altSetting);
         if (rcAlt != LIBUSB_SUCCESS) {
             outError = std::string("libusb_set_interface_alt_setting(IF#") +
                        std::to_string(alt.interfaceNumber) + ", Alt#" +
                        std::to_string(alt.altSetting) + ") failed: " + libusb_error_name(rcAlt);
             BP_LOGE("%s", outError.c_str());
+            writeTrace("FAIL uac1_set_interface_alt_setting");
             return false;
         }
+        writeTrace("OK uac1_set_interface_alt_setting");
         BP_LOGI("Activated AudioStreaming IF#%d Alt#%d (%s)",
                 alt.interfaceNumber, alt.altSetting, uac::pcmFormatToString(alt.pcmFormat));
         if (!setUac1ClockRateLocked(alt, sampleRate, verifiedRate, outError)) {
+            writeTrace("FAIL setUac1ClockRate");
             return false;
         }
     }
 
-    // Step 5: Allow DAC PLL, digital filter & unmute relay to settle cleanly before submitting ISO URBs
+    // Step 4: Allow DAC PLL, digital filter & unmute relay to settle cleanly before submitting ISO URBs
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
 
     activeAlt_ = alt;
     activeSampleRate_ = sampleRate;
     hardwareConfigured_ = true;
+    writeTrace("DONE configureHardware");
     return true;
 }
 
@@ -793,7 +936,7 @@ bool UsbDacEngine::startSineTest(uint32_t sampleRate, int preferredBitDepth, std
 
     if (!isoStreamer_.start(
             ctx_, handle_, profile_.usbSpeed, altCopy, sampleRate,
-            &ringBuffer_, targetBufBytes, outError)) {
+            &ringBuffer_, targetBufBytes, !isQualcommPlatform_, outError)) {
         stopStreamLocked();
         return false;
     }
@@ -963,7 +1106,7 @@ size_t UsbDacEngine::pushCapturedPcmFrames(const uint8_t* data, size_t frameCoun
                 std::string startErr;
                 if (isoStreamer_.start(
                         ctx_, handle_, profile_.usbSpeed, activeAlt_, activeSampleRate_,
-                        &ringBuffer_, targetBytes, startErr)) {
+                        &ringBuffer_, targetBytes, !isQualcommPlatform_, startErr)) {
                     capturePrefilling_.store(false, std::memory_order_release);
                     BP_LOGI("Pre-fill reached %.1f%% (%zu / %zu bytes) -> USB ISO OUT streaming ACTIVE!",
                             100.0 * static_cast<double>(ringBuffer_.availableRead()) /
@@ -1089,6 +1232,7 @@ void UsbDacEngine::closeLocked(bool restoreUnityVolume) {
         libusb_close(handle_);
         handle_ = nullptr;
         BP_LOGI("libusb device handle closed");
+        writeTrace("DONE closeLocked");
     }
 
     if (ctx_) {

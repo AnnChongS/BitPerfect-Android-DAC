@@ -66,6 +66,7 @@ bool UsbIsoStreamer::start(
     uint32_t sampleRate,
     SpscRingBuffer* ringBuffer,
     size_t targetBufferBytes,
+    bool conservativeXhciRing,
     std::string& outError
 ) {
     stop();
@@ -87,6 +88,7 @@ bool UsbIsoStreamer::start(
     sampleRate_ = sampleRate;
     ringBuffer_ = ringBuffer;
     targetBufferBytes_.store(targetBufferBytes, std::memory_order_relaxed);
+    firstOutCbLogged_ = false;
 
     // Enable explicit async feedback ONLY when endpoint is Async + has explicit Feedback EP
     useFeedback_ = (alt.syncType == uac::EndpointSyncType::Asynchronous) &&
@@ -103,24 +105,43 @@ bool UsbIsoStreamer::start(
     );
 
     // Adaptive URB sizing:
-    //  - Low-latency rhythm-game mode (target <= 85ms): 2.0ms/URB (12 URBs = 24ms xHCI DMA ring)
-    //  - Hi-Fi mode (target > 85ms): 4.0ms/URB (12 URBs = 48ms xHCI DMA ring, half ioctl overhead)
+    //  - Conservative single-segment xHCI ring (non-Qualcomm SoCs: XRING / Exynos / Dimensity / Tensor):
+    //      6 URBs x 16 ISO pkts = 96 microframes (12ms DMA ring, strictly < 256 TRBs so xHCI never
+    //      expands the ISO transfer ring segment).
+    //  - Qualcomm low-latency mode (target <= 85ms): 12 URBs x 16 pkts = 24ms DMA ring.
+    //  - Qualcomm Hi-Fi mode (target > 85ms): 12 URBs x 32 pkts = 48ms DMA ring.
     const double targetMs = (sampleRate_ > 0 && frameBytes_ > 0)
         ? (1000.0 * static_cast<double>(targetBufferBytes)) /
           (static_cast<double>(sampleRate_) * static_cast<double>(frameBytes_))
         : 250.0;
     const bool lowLatencyMode = (targetMs <= 85.0);
 
-    if (pacer_.isHighSpeed()) {
-        if (pacer_.intervalsPerSec() >= 8000u) {
-            numIsoPacketsPerUrb_ = lowLatencyMode ? 16 : 32; // 2.0ms or 4.0ms per URB
-        } else if (pacer_.intervalsPerSec() >= 4000u) {
-            numIsoPacketsPerUrb_ = lowLatencyMode ? 8 : 16;
+    if (conservativeXhciRing) {
+        activeOutUrbs_ = 6;
+        if (pacer_.isHighSpeed()) {
+            if (pacer_.intervalsPerSec() >= 8000u) {
+                numIsoPacketsPerUrb_ = 16; // 2.0ms/URB -> 6 URBs = 96 microframes (12ms, < 256 TRBs)
+            } else if (pacer_.intervalsPerSec() >= 4000u) {
+                numIsoPacketsPerUrb_ = 8;
+            } else {
+                numIsoPacketsPerUrb_ = 4;
+            }
         } else {
-            numIsoPacketsPerUrb_ = lowLatencyMode ? 4 : 8;
+            numIsoPacketsPerUrb_ = 2; // 2.0ms/URB on Full-Speed
         }
     } else {
-        numIsoPacketsPerUrb_ = lowLatencyMode ? 2 : 4; // 2.0ms or 4.0ms per URB on Full-Speed
+        activeOutUrbs_ = kNumOutUrbs;
+        if (pacer_.isHighSpeed()) {
+            if (pacer_.intervalsPerSec() >= 8000u) {
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 16 : 32; // 2.0ms or 4.0ms per URB
+            } else if (pacer_.intervalsPerSec() >= 4000u) {
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 8 : 16;
+            } else {
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 4 : 8;
+            }
+        } else {
+            numIsoPacketsPerUrb_ = lowLatencyMode ? 2 : 4; // 2.0ms or 4.0ms per URB on Full-Speed
+        }
     }
 
     packetsSubmitted_.store(0, std::memory_order_relaxed);
@@ -134,16 +155,17 @@ bool UsbIsoStreamer::start(
     running_.store(true, std::memory_order_release);
 
     BP_LOGI("Starting USB ISO streamer: rate=%uHz fmt=%s (%uB/frame) sync=%s fb=%s "
-            "intervals=%u/s urbs=%d pkts/urb=%d maxPkt=%uB",
+            "intervals=%u/s urbs=%d pkts/urb=%d maxPkt=%uB xhciSafe=%s",
             sampleRate_,
             uac::pcmFormatToString(alt.pcmFormat),
             frameBytes_,
             uac::syncTypeToString(alt.syncType),
             useFeedback_ ? "ON" : "OFF",
             pacer_.intervalsPerSec(),
-            kNumOutUrbs,
+            activeOutUrbs_,
             numIsoPacketsPerUrb_,
-            alt.maxPacketBytesPerInterval);
+            alt.maxPacketBytesPerInterval,
+            conservativeXhciRing ? "ON" : "OFF");
 
     eventThread_ = std::thread(&UsbIsoStreamer::eventLoopThread, this);
     return true;
@@ -169,11 +191,11 @@ void UsbIsoStreamer::eventLoopThread() {
 
     // Allocate OUT transfer slots exclusively on the ISO thread
     outSlots_.clear();
-    outSlots_.reserve(kNumOutUrbs);
+    outSlots_.reserve(static_cast<size_t>(activeOutUrbs_));
     const size_t maxUrbBufBytes =
         static_cast<size_t>(numIsoPacketsPerUrb_) * activeAlt_.maxPacketBytesPerInterval;
 
-    for (int i = 0; i < kNumOutUrbs; ++i) {
+    for (int i = 0; i < activeOutUrbs_; ++i) {
         auto slot = std::make_unique<TransferSlot>();
         slot->owner = this;
         slot->isFeedback = false;
@@ -228,7 +250,8 @@ void UsbIsoStreamer::eventLoopThread() {
         }
     }
 
-    // Submit initial Feedback URBs first, then all 12 OUT URBs
+    // Submit initial Feedback URBs first, then all OUT URBs
+    if (onTrace_) onTrace_("ENTER iso_submit_initial_urbs");
     for (auto& slot : fbSlots_) {
         if (!stopRequested_.load(std::memory_order_acquire)) {
             submitFeedbackSlot(slot.get());
@@ -239,6 +262,7 @@ void UsbIsoStreamer::eventLoopThread() {
             fillAndSubmitOutSlot(slot.get());
         }
     }
+    if (onTrace_) onTrace_("OK iso_submit_initial_urbs");
 
     // Real-time event loop (hot path: zero allocations, zero locks)
     bool cancelled = false;
@@ -385,6 +409,11 @@ void UsbIsoStreamer::onFeedbackTransferComplete(libusb_transfer* xfer) {
 void UsbIsoStreamer::handleOutComplete(TransferSlot* slot, libusb_transfer* xfer) {
     slot->active.store(false, std::memory_order_release);
     inFlightCount_.fetch_sub(1, std::memory_order_acq_rel);
+
+    if (!firstOutCbLogged_) {
+        firstOutCbLogged_ = true;
+        if (onTrace_) onTrace_("OK first_iso_out_callback");
+    }
 
     const uint64_t nowNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(

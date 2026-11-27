@@ -188,6 +188,10 @@ public:
         onThreadStarted_ = std::move(cb);
     }
 
+    void setTraceCallback(std::function<void(const char*)> cb) {
+        onTrace_ = std::move(cb);
+    }
+
     int isoThreadTid() const { return isoThreadTid_.load(std::memory_order_acquire); }
 
     bool start(
@@ -198,6 +202,7 @@ public:
         uint32_t sampleRate,
         SpscRingBuffer* ringBuffer,
         size_t targetBufferBytes,
+        bool conservativeXhciRing,
         std::string& outError
     );
 
@@ -232,8 +237,10 @@ private:
     uac::AudioStreamAltSetting activeAlt_{};
     uint32_t sampleRate_ = 0;
     uint32_t frameBytes_ = 4;
+    int activeOutUrbs_ = kNumOutUrbs;
     int numIsoPacketsPerUrb_ = 16;
     bool useFeedback_ = false;
+    bool firstOutCbLogged_ = false;
 
     SpscRingBuffer* ringBuffer_ = nullptr;
     IsoPacketPacer pacer_;
@@ -253,6 +260,7 @@ private:
     std::atomic<int> isoThreadTid_{0};
     uint64_t lastOutCallbackNs_{0};
     IsoThreadStartedCallback onThreadStarted_;
+    std::function<void(const char*)> onTrace_;
 
     std::thread eventThread_;
 };

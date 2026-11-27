@@ -32,15 +32,20 @@ public:
     UsbDacEngine(const UsbDacEngine&) = delete;
     UsbDacEngine& operator=(const UsbDacEngine&) = delete;
 
-    // Wraps Android UsbDeviceConnection fd, executes two-stage clean USB claim
-    // (IF#2 Playback -> 4ms silent ISO handshake -> IF#0 AudioControl, skipping IF#1 Mic),
-    // parses UAC1/UAC2 descriptors, and initializes hardware volume.
+    // Configure crash-proof fsync() USB syscall trace file path for SoC diagnostics
+    void setTraceFilePath(const std::string& path);
+
+    // Wraps Android UsbDeviceConnection fd, executes platform-safe USB claim:
+    //  - Qualcomm: two-stage (IF#2 -> 4ms silent ISO warmup -> IF#0, skipping IF#1)
+    //  - Non-Qualcomm (XRING / Exynos / MediaTek / Tensor): standard offload-safe order
+    //    (IF#0 detach first -> 50ms settle -> claim IF#0 & IF#2, ZERO ISO warmup, ZERO clear_halt)
     bool openAndInspect(
         int fd,
         uint16_t fallbackVid,
         uint16_t fallbackPid,
         const std::string& fallbackName,
         double initialVolumeDb,
+        bool isQualcommPlatform,
         std::string& outReport,
         std::string& outProfileJson,
         std::string& outError
@@ -88,6 +93,7 @@ public:
     std::string getTelemetryJson() const;
 
 private:
+    void writeTrace(const std::string& step, bool truncate = false) const;
     bool initLibusbContext(std::string& outError);
     void claimAudioInterfacesLocked();
     int controlTransferAcLocked(
@@ -140,6 +146,8 @@ private:
     std::vector<int> claimedInterfaces_;
     uac::DacDeviceProfile profile_;
     bool isOpen_ = false;
+    bool isQualcommPlatform_ = false;
+    std::string traceFilePath_;
 
     // Active audio streaming state
     uac::AudioStreamAltSetting activeAlt_{};

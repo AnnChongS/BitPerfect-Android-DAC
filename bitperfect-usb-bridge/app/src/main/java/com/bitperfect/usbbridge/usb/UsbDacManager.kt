@@ -58,6 +58,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -480,6 +481,20 @@ class UsbDacManager(context: Context) {
     fun start() {
         NativeUsbAudioBridge.setLogListener(nativeLogListener)
         NativeUsbAudioBridge.setIsoThreadListener(null) // Pure Zero-Root architecture
+
+        // Configure crash-proof fsync() USB syscall trace & surface any prior incomplete trace
+        val traceFile = File(appContext.filesDir, "last_usb_trace.txt")
+        NativeUsbAudioBridge.setTraceFilePath(traceFile.absolutePath)
+        if (traceFile.isFile) {
+            val prevTrace = runCatching { traceFile.readText().trim() }.getOrDefault("")
+            if (prevTrace.isNotEmpty() && !prevTrace.contains("DONE closeLocked")) {
+                appendLog(2, "PREV-USB", "检测到上次未正常关闭的 USB 系统调用轨迹 (last_usb_trace.txt):")
+                prevTrace.lines().takeLast(20).forEach { line ->
+                    appendLog(2, "PREV-USB", "  $line")
+                }
+            }
+        }
+
         shizukuController.start()
         refreshSystemMusicVolume()
         restoreSavedSelectedApp()
@@ -986,10 +1001,15 @@ class UsbDacManager(context: Context) {
             _connectionState.value = DacConnectionState.Error(msg)
             return null
         }
+        val claimModeLog = if (socProfile.useQualcommPalPreWarm) {
+            "高通两阶段接管 (IF#2 -> IF#0，跳过 IF#1)"
+        } else {
+            "通用 Offload 安全接管 (先剥离 IF#0 -> 50ms -> 认领 IF#0/IF#2，零预发 ISO、零 clear_halt)"
+        }
         appendLog(
             1,
             "KT",
-            "已打开 UsbDeviceConnection: $name (fd=$fd)，执行 C++ 渐进式两阶段接管 (IF#2 -> 15ms -> IF#0，跳过 IF#1 麦克风)..."
+            "已打开 UsbDeviceConnection: $name (fd=$fd)，执行 C++ $claimModeLog..."
         )
 
         val inspectResult = NativeUsbAudioBridge.openAndInspect(
@@ -997,7 +1017,8 @@ class UsbDacManager(context: Context) {
             vendorId = device.vendorId,
             productId = device.productId,
             fallbackName = name,
-            initialVolumeDb = initialVolumeDb
+            initialVolumeDb = initialVolumeDb,
+            isQualcommPlatform = socProfile.useQualcommPalPreWarm
         )
 
         return when (inspectResult) {
