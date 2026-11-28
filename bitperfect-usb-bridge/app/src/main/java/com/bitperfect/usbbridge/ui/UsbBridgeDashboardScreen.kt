@@ -132,6 +132,8 @@ fun UsbBridgeDashboardScreen(
     manualSampleRate: Int,
     systemMusicVolume: SystemVolumeState,
     isBatteryOptIgnored: Boolean,
+    xringHubDisclaimerActive: Boolean,
+    xringHubDisclaimerAccepted: Boolean,
     devices: List<DiscoveredUsbAudioDevice>,
     connectionState: DacConnectionState,
     telemetry: StreamTelemetry,
@@ -144,6 +146,7 @@ fun UsbBridgeDashboardScreen(
     logs: List<LogEntry>,
     onToggleLanguage: () -> Unit,
     onSelectLanguagePref: (LanguagePref) -> Unit,
+    onAcceptXringHubDisclaimer: () -> Unit,
     onRefreshDevices: () -> Unit,
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
@@ -174,6 +177,15 @@ fun UsbBridgeDashboardScreen(
 ) {
     var activeTab by remember { mutableIntStateOf(0) }
     var showAppPickerDialog by remember { mutableStateOf(false) }
+    var pendingHubAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    fun runWithXringHubDisclaimer(action: () -> Unit) {
+        if (xringHubDisclaimerActive && !xringHubDisclaimerAccepted) {
+            pendingHubAction = action
+        } else {
+            action()
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -198,6 +210,12 @@ fun UsbBridgeDashboardScreen(
                 )
             }
 
+            if (xringHubDisclaimerActive) {
+                item {
+                    XringHubDisclaimerBanner(s = strings)
+                }
+            }
+
             if (!isBatteryOptIgnored) {
                 item {
                     BatteryGuardBanner(
@@ -214,8 +232,8 @@ fun UsbBridgeDashboardScreen(
                     connectionState = connectionState,
                     bridgeActive = bridgeState.active,
                     onRefreshDevices = onRefreshDevices,
-                    onConnectDevice = onConnectDevice,
-                    onClaimArmedUsbNow = onClaimArmedUsbNow,
+                    onConnectDevice = { dev -> runWithXringHubDisclaimer { onConnectDevice(dev) } },
+                    onClaimArmedUsbNow = { runWithXringHubDisclaimer(onClaimArmedUsbNow) },
                     onDisconnect = onDisconnect
                 )
             }
@@ -257,7 +275,7 @@ fun UsbBridgeDashboardScreen(
                             if (installedApps.isEmpty()) onRefreshInstalledApps()
                             showAppPickerDialog = true
                         } else {
-                            onStartAudioBridge()
+                            runWithXringHubDisclaimer(onStartAudioBridge)
                         }
                     },
                     onStopBridge = onStopAudioBridge,
@@ -303,9 +321,9 @@ fun UsbBridgeDashboardScreen(
                     onCopyLogs = onCopyLogs,
                     onDumpSnapshot = onDumpAndCopySnapshot,
                     onClearLogs = onClearLogs,
-                    onToggleSineTest = onToggleSineTest,
-                    onSelectSinePreset = onSelectSinePreset,
-                    onClaimArmedUsbNow = onClaimArmedUsbNow,
+                    onToggleSineTest = { runWithXringHubDisclaimer(onToggleSineTest) },
+                    onSelectSinePreset = { preset -> runWithXringHubDisclaimer { onSelectSinePreset(preset) } },
+                    onClaimArmedUsbNow = { runWithXringHubDisclaimer(onClaimArmedUsbNow) },
                     onCopyReport = onCopyReport
                 )
             }
@@ -326,6 +344,19 @@ fun UsbBridgeDashboardScreen(
             onDismiss = { showAppPickerDialog = false }
         )
     }
+
+    val pendingAction = pendingHubAction
+    if (pendingAction != null) {
+        XringHubDisclaimerDialog(
+            s = strings,
+            onDismiss = { pendingHubAction = null },
+            onAccept = {
+                pendingHubAction = null
+                onAcceptXringHubDisclaimer()
+                pendingAction()
+            }
+        )
+    }
 }
 
 @Composable
@@ -339,6 +370,8 @@ private fun HeaderSection(
     onToggleLanguage: () -> Unit
 ) {
     val (badgeText, badgeDot, badgeBg, badgeBorder) = when {
+        connectionState is DacConnectionState.BlockedBySoc ->
+            Quad(s.badgeBlocked, CoralDanger, CoralDimBg, CoralBorder)
         bridgeState.active && telemetry.streaming ->
             Quad(s.badgeStreaming, EmeraldLive, EmeraldDimBg, EmeraldBorder)
         bridgeState.active ->
@@ -518,6 +551,101 @@ private fun BatteryGuardBanner(
 }
 
 @Composable
+private fun XringHubDisclaimerBanner(s: UsbBridgeStrings) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(AmberDimBg)
+            .border(1.dp, AmberBorder, RoundedCornerShape(14.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            text = s.xringHubBannerTitle,
+            color = AmberWarn,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.Bold,
+            lineHeight = 17.sp,
+            style = TightTextStyle
+        )
+        Text(
+            text = s.xringHubBannerBody,
+            color = TextSecondary,
+            fontSize = 11.sp,
+            lineHeight = 16.sp,
+            style = TightTextStyle
+        )
+    }
+}
+
+@Composable
+private fun XringHubDisclaimerDialog(
+    s: UsbBridgeStrings,
+    onDismiss: () -> Unit,
+    onAccept: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .clip(RoundedCornerShape(18.dp))
+                .background(CardBg)
+                .border(1.dp, AmberBorder, RoundedCornerShape(18.dp))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = s.xringHubDialogTitle,
+                color = AmberWarn,
+                fontSize = 15.5.sp,
+                fontWeight = FontWeight.Bold,
+                lineHeight = 20.sp,
+                style = TightTextStyle
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(TileBg)
+                    .border(1.dp, TileBorder, RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = s.xringHubDialogBody,
+                    color = TextPrimary,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                    style = TightTextStyle
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                UniformButton(
+                    text = s.xringHubDialogCancel,
+                    onClick = onDismiss,
+                    height = 40.dp,
+                    style = BtnStyle.Ghost,
+                    modifier = Modifier.weight(0.85f)
+                )
+                UniformButton(
+                    text = s.xringHubDialogAccept,
+                    onClick = onAccept,
+                    height = 40.dp,
+                    style = BtnStyle.Warning,
+                    modifier = Modifier.weight(1.4f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun UsbHardwareCard(
     s: UsbBridgeStrings,
     devices: List<DiscoveredUsbAudioDevice>,
@@ -540,11 +668,13 @@ private fun UsbHardwareCard(
                     "${connectionState.profile.uacVersion} · ${connectionState.profile.vidPidHex}"
                 is DacConnectionState.ArmedStandby ->
                     s.usbStandbyTag(connectionState.vidPid)
+                is DacConnectionState.BlockedBySoc ->
+                    "${s.xringBlockedTag} · ${connectionState.vidPid}"
                 else -> s.usbFoundCount(devices.size)
             }
             Text(
                 text = subTag,
-                color = TextSecondary,
+                color = if (connectionState is DacConnectionState.BlockedBySoc) CoralDanger else TextSecondary,
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace,
                 style = TightTextStyle
@@ -554,6 +684,68 @@ private fun UsbHardwareCard(
         Spacer(modifier = Modifier.height(10.dp))
 
         when (connectionState) {
+            is DacConnectionState.BlockedBySoc -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(CoralDimBg)
+                        .border(1.dp, CoralBorder, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text(
+                            text = s.xringBlockedTitle,
+                            color = CoralDanger,
+                            fontSize = 13.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            lineHeight = 18.sp,
+                            style = TightTextStyle
+                        )
+                        Text(
+                            text = "${connectionState.displayName} (${connectionState.vidPid}) · ${connectionState.topologyDetail}",
+                            color = TextPrimary,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 15.sp,
+                            style = TightTextStyle
+                        )
+                        Text(
+                            text = if (connectionState.circuitBreakerTripped) {
+                                s.xringBlockedBreakerBody
+                            } else {
+                                s.xringBlockedBody
+                            },
+                            color = TextSecondary,
+                            fontSize = 11.5.sp,
+                            lineHeight = 16.5.sp,
+                            style = TightTextStyle
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    UniformButton(
+                        text = s.btnScanUsb,
+                        onClick = onRefreshDevices,
+                        height = 38.dp,
+                        style = BtnStyle.Secondary,
+                        modifier = Modifier.weight(0.9f)
+                    )
+                    UniformButton(
+                        text = s.btnBlockedDisabled,
+                        onClick = {},
+                        enabled = false,
+                        height = 38.dp,
+                        style = BtnStyle.Danger,
+                        modifier = Modifier.weight(1.3f)
+                    )
+                }
+            }
+
             is DacConnectionState.Connected -> {
                 val p = connectionState.profile
                 val maxRateKhz = "%.1f".format((p.allSupportedSampleRates.maxOrNull() ?: 192000) / 1000.0)
@@ -713,12 +905,17 @@ private fun UsbHardwareCard(
                         style = BtnStyle.Secondary,
                         modifier = Modifier.weight(1f)
                     )
+                    val canConnectFirst = firstDev != null && !firstDev.isBlockedDirectXring
                     UniformButton(
-                        text = if (firstDev?.hasPermission == true) s.btnArmReady else s.btnGrantConnect,
-                        onClick = { firstDev?.let(onConnectDevice) },
-                        enabled = firstDev != null,
+                        text = when {
+                            firstDev?.isBlockedDirectXring == true -> s.btnBlockedDisabled
+                            firstDev?.hasPermission == true -> s.btnArmReady
+                            else -> s.btnGrantConnect
+                        },
+                        onClick = { if (canConnectFirst) firstDev?.let(onConnectDevice) },
+                        enabled = canConnectFirst,
                         height = 38.dp,
-                        style = BtnStyle.Primary,
+                        style = if (firstDev?.isBlockedDirectXring == true) BtnStyle.Danger else BtnStyle.Primary,
                         modifier = Modifier.weight(1f)
                     )
                 }

@@ -106,8 +106,10 @@ bool UsbIsoStreamer::start(
 
     // Adaptive URB sizing:
     //  - Conservative single-segment xHCI ring (non-Qualcomm SoCs: XRING / Exynos / Dimensity / Tensor):
-    //      6 URBs x 16 ISO pkts = 96 microframes (12ms DMA ring, strictly < 256 TRBs so xHCI never
-    //      expands the ISO transfer ring segment).
+    //      * Low-latency mode (<= 85ms): 6 URBs x 16 pkts = 96 microframes (12ms DMA ring, < 255 TRBs)
+    //      * Hi-Fi mode (> 85ms):        6 URBs x 32 pkts = 192 microframes (24ms DMA ring, < 255 TRBs)
+    //      Both stay strictly inside ONE 256-TRB xHCI transfer ring segment (zero ring expansion) while
+    //      giving 24ms USB wire headroom to absorb USB Hub / OEM scheduler spikes (e.g. 15ms gaps).
     //  - Qualcomm low-latency mode (target <= 85ms): 12 URBs x 16 pkts = 24ms DMA ring.
     //  - Qualcomm Hi-Fi mode (target > 85ms): 12 URBs x 32 pkts = 48ms DMA ring.
     const double targetMs = (sampleRate_ > 0 && frameBytes_ > 0)
@@ -120,14 +122,14 @@ bool UsbIsoStreamer::start(
         activeOutUrbs_ = 6;
         if (pacer_.isHighSpeed()) {
             if (pacer_.intervalsPerSec() >= 8000u) {
-                numIsoPacketsPerUrb_ = 16; // 2.0ms/URB -> 6 URBs = 96 microframes (12ms, < 256 TRBs)
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 16 : 32; // 12ms (96 TRBs) or 24ms (192 TRBs < 255)
             } else if (pacer_.intervalsPerSec() >= 4000u) {
-                numIsoPacketsPerUrb_ = 8;
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 8 : 16;
             } else {
-                numIsoPacketsPerUrb_ = 4;
+                numIsoPacketsPerUrb_ = lowLatencyMode ? 4 : 8;
             }
         } else {
-            numIsoPacketsPerUrb_ = 2; // 2.0ms/URB on Full-Speed
+            numIsoPacketsPerUrb_ = lowLatencyMode ? 2 : 4; // 12ms or 24ms on Full-Speed
         }
     } else {
         activeOutUrbs_ = kNumOutUrbs;

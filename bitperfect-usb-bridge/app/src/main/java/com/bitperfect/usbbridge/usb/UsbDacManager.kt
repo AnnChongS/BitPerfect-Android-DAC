@@ -31,6 +31,10 @@ import com.bitperfect.usbbridge.nativebridge.NativeLogListener
 import com.bitperfect.usbbridge.nativebridge.NativeUsbAudioBridge
 import com.bitperfect.usbbridge.nativebridge.StreamTelemetry
 import com.bitperfect.usbbridge.platform.SocCompatibilityProfile
+import com.bitperfect.usbbridge.platform.SocVendor
+import com.bitperfect.usbbridge.platform.UsbConnectionTopology
+import com.bitperfect.usbbridge.platform.UsbTopologyDetector
+import com.bitperfect.usbbridge.platform.UsbTopologyInfo
 import com.bitperfect.usbbridge.service.MediaProjectionBridgeHolder
 import com.bitperfect.usbbridge.service.UsbBridgeService
 import com.bitperfect.usbbridge.shizuku.DetectedAudioSpec
@@ -78,7 +82,10 @@ data class DiscoveredUsbAudioDevice(
     val displayName: String,
     val vidPid: String,
     val hasPermission: Boolean,
-    val audioInterfaceCount: Int
+    val audioInterfaceCount: Int,
+    val topologyInfo: UsbTopologyInfo,
+    val isBlockedDirectXring: Boolean = false,
+    val isXringHubWarning: Boolean = false
 )
 
 data class SineTestPreset(
@@ -186,6 +193,18 @@ sealed class DacConnectionState {
         val device: UsbDevice,
         val profile: DacProfile,
         val fullReport: String
+    ) : DacConnectionState()
+
+    /**
+     * Hard-blocked state on Xiaomi XRING O1 when a direct-plugged USB DAC is detected (or when the
+     * runtime ADSP-reset circuit breaker trips). Prevents infinite USB permission popups and system
+     * freeze risks caused by `xring_usb_adsp_v1.ko`.
+     */
+    data class BlockedBySoc(
+        val displayName: String,
+        val vidPid: String,
+        val topologyDetail: String,
+        val circuitBreakerTripped: Boolean = false
     ) : DacConnectionState()
 
     data class Error(val message: String) : DacConnectionState()
@@ -297,6 +316,16 @@ class UsbDacManager(context: Context) {
     @Volatile
     private var savedPreBridgeSystemVolume: Int = -1
 
+    // Xiaomi XRING O1 Direct-USB Hard Block & Runtime ADSP-Reset Circuit Breaker
+    @Volatile
+    private var lastXringClaimStartMs: Long = 0L
+
+    @Volatile
+    private var xringAdspCircuitBreakerTripped: Boolean = false
+
+    @Volatile
+    private var lastLoggedXringBlockKey: String = ""
+
     // Auto-Heal Watchdog state (detects zeroDropout bursts in both Non-Root & Shizuku modes)
     @Volatile
     private var zeroWatchWindowStartMs: Long = 0L
@@ -391,8 +420,19 @@ class UsbDacManager(context: Context) {
     private val _systemMusicVolume = MutableStateFlow(readSystemMusicVolume())
     val systemMusicVolume: StateFlow<SystemVolumeState> = _systemMusicVolume.asStateFlow()
 
+    private val _xringHubDisclaimerActive = MutableStateFlow(false)
+    val xringHubDisclaimerActive: StateFlow<Boolean> = _xringHubDisclaimerActive.asStateFlow()
+
+    private val _xringHubDisclaimerAccepted = MutableStateFlow(false)
+    val xringHubDisclaimerAccepted: StateFlow<Boolean> = _xringHubDisclaimerAccepted.asStateFlow()
+
     private val _logs = MutableStateFlow<List<LogEntry>>(emptyList())
     val logs: StateFlow<List<LogEntry>> = _logs.asStateFlow()
+
+    fun acceptXringHubDisclaimer() {
+        _xringHubDisclaimerAccepted.value = true
+        appendLog(2, "XRING-GUARD", "用户已确认玄戒 O1 USB Hub 实验性兼容模式免责声明（稳定性与音质不作保证）")
+    }
 
     private val nativeLogListener = object : NativeLogListener {
         override fun onNativeLog(level: Int, message: String) {
@@ -433,6 +473,16 @@ class UsbDacManager(context: Context) {
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     appendLog(2, "KT", "检测到 USB 拔出: ${dev?.let(::deviceDisplayName) ?: "unknown"}")
+                    val elapsedSinceClaim = SystemClock.elapsedRealtime() - lastXringClaimStartMs
+                    if (socProfile.vendor == SocVendor.XRING && lastXringClaimStartMs > 0L && elapsedSinceClaim in 0L..3500L) {
+                        xringAdspCircuitBreakerTripped = true
+                        appendLog(
+                            3,
+                            "XRING-GUARD",
+                            "检测到接管 USB 后 ${elapsedSinceClaim}ms 内发生断连（玄戒内核 ADSP 总线复位），已触发防死机熔断保护并禁用此次会话！"
+                        )
+                    }
+                    _xringHubDisclaimerAccepted.value = false
                     if (dev != null &&
                         (activeSession?.device?.deviceId == dev.deviceId || armedDevice?.deviceId == dev.deviceId)
                     ) {
@@ -1048,6 +1098,10 @@ class UsbDacManager(context: Context) {
 
             sb.append("========== BitPerfect USB Bridge v${BuildConfig.VERSION_NAME} 诊断快照 ==========\n")
             sb.append("Platform: ${socProfile.diagnosticSummary()}\n")
+            val usbTopoSummary = _discoveredDevices.value.firstOrNull()?.let { d ->
+                "${d.topologyInfo.topology.name} (${d.topologyInfo.detail}) blocked=${d.isBlockedDirectXring} hubWarn=${d.isXringHubWarning}"
+            } ?: "none"
+            sb.append("UsbTopology: $usbTopoSummary | xringBreaker=$xringAdspCircuitBreakerTripped\n")
             sb.append("Scope: ${_captureScopeMode.value.name} (selected=${_selectedApp.value?.packageName ?: "GLOBAL"}, tracked=${_trackedPlayer.value?.packageName ?: "none"})\n")
             sb.append("OperatingMode: ${_operatingMode.value.shortLabel} | Shizuku: ${shizukuState.value.shortBadge} | SysMusicVol: ${sysVol.current}/${sysVol.max}\n")
             sb.append("r_submix: ${_remoteSubmixProfile.value?.rawSummary ?: "未探测 (非 Shizuku 模式)"}\n")
@@ -1076,16 +1130,31 @@ class UsbDacManager(context: Context) {
     // -------------------------------------------------------------------------
 
     fun refreshDevices() {
-        val audioDevices = usbManager.deviceList.values
+        val allUsbDevices = usbManager.deviceList.values
+        val audioDevices = allUsbDevices
             .mapNotNull { dev ->
                 val uniqueAudioIfIds = collectUniqueAudioInterfaces(dev)
                 if (uniqueAudioIfIds.isEmpty()) return@mapNotNull null
+                val topo = UsbTopologyDetector.detect(dev, allUsbDevices, socProfile.vendor)
+                val blocked = UsbTopologyDetector.isBlockedForXringDirectUsb(
+                    socVendor = socProfile.vendor,
+                    info = topo,
+                    circuitBreakerTripped = xringAdspCircuitBreakerTripped
+                )
+                val hubWarn = UsbTopologyDetector.isXringHubDisclaimerRequired(
+                    socVendor = socProfile.vendor,
+                    info = topo,
+                    circuitBreakerTripped = xringAdspCircuitBreakerTripped
+                )
                 DiscoveredUsbAudioDevice(
                     device = dev,
                     displayName = deviceDisplayName(dev),
                     vidPid = "%04X:%04X".format(dev.vendorId, dev.productId),
                     hasPermission = usbManager.hasPermission(dev),
-                    audioInterfaceCount = uniqueAudioIfIds.size
+                    audioInterfaceCount = uniqueAudioIfIds.size,
+                    topologyInfo = topo,
+                    isBlockedDirectXring = blocked,
+                    isXringHubWarning = hubWarn
                 )
             }
             .sortedBy { it.displayName }
@@ -1093,13 +1162,109 @@ class UsbDacManager(context: Context) {
         _discoveredDevices.value = audioDevices
         appendLog(1, "KT", "扫描 USB 总线: 发现 ${audioDevices.size} 台 USB Audio DAC")
 
-        // Auto-arm single already-permitted USB DAC on launch
-        if (activeSession == null && armedDevice == null && audioDevices.size == 1 && audioDevices[0].hasPermission) {
-            onUsbPermissionReady(audioDevices[0].device)
+        if (audioDevices.isEmpty()) {
+            _xringHubDisclaimerActive.value = false
+            _xringHubDisclaimerAccepted.value = false
+            lastLoggedXringBlockKey = ""
+            // Only clear XRING ADSP circuit breaker after >5s since last claim attempt so a transient
+            // ~668ms xHCI ADSP bus-reset reconnect cannot clear the lockout!
+            if (xringAdspCircuitBreakerTripped &&
+                (SystemClock.elapsedRealtime() - lastXringClaimStartMs) > 5000L
+            ) {
+                xringAdspCircuitBreakerTripped = false
+            }
+            if (activeSession == null && armedDevice == null && _connectionState.value is DacConnectionState.BlockedBySoc) {
+                _connectionState.value = DacConnectionState.Disconnected
+            }
+            return
+        }
+
+        if (socProfile.vendor == SocVendor.XRING) {
+            // If user unplugged direct DAC and switched to a kernel-proven USB Hub, release breaker
+            val hasKernelProvenHub = audioDevices.any {
+                it.topologyInfo.isKernelProven && it.topologyInfo.topology == UsbConnectionTopology.VIA_USB_HUB
+            }
+            if (hasKernelProvenHub && xringAdspCircuitBreakerTripped) {
+                xringAdspCircuitBreakerTripped = false
+                refreshDevices()
+                return
+            }
+
+            _xringHubDisclaimerActive.value = audioDevices.any { it.isXringHubWarning }
+
+            if (audioDevices.all { it.isBlockedDirectXring }) {
+                val first = audioDevices.first()
+                armedDevice = null
+                _connectionState.value = DacConnectionState.BlockedBySoc(
+                    displayName = first.displayName,
+                    vidPid = first.vidPid,
+                    topologyDetail = first.topologyInfo.detail,
+                    circuitBreakerTripped = xringAdspCircuitBreakerTripped
+                )
+                val blockKey = "${first.device.deviceName}:${first.topologyInfo.detail}:$xringAdspCircuitBreakerTripped"
+                if (blockKey != lastLoggedXringBlockKey) {
+                    lastLoggedXringBlockKey = blockKey
+                    appendLog(
+                        3,
+                        "XRING-GUARD",
+                        "已主动禁用直插 USB 独占: ${first.displayName} (${first.topologyInfo.detail})。" +
+                            "小米玄戒 O1 内核 xring_usb_adsp 会强制接管直插声卡，继续操作会触发无限授权弹窗并存在卡死机风险。" +
+                            "如需无 Root 应急请经由外接 USB Hub 连接（稳定性与音质不保证），或使用 Root 版。"
+                    )
+                }
+                return
+            } else {
+                val hubDev = audioDevices.firstOrNull { it.isXringHubWarning }
+                if (hubDev != null) {
+                    val hubKey = "hub:${hubDev.device.deviceName}:${hubDev.topologyInfo.detail}"
+                    if (hubKey != lastLoggedXringBlockKey) {
+                        lastLoggedXringBlockKey = hubKey
+                        appendLog(
+                            2,
+                            "XRING-GUARD",
+                            "检测到玄戒 O1 经由 USB Hub 连接声卡 (${hubDev.topologyInfo.detail})：已开放实验性使用，但不保证稳定性与音质"
+                        )
+                    }
+                }
+            }
+        } else {
+            _xringHubDisclaimerActive.value = false
+        }
+
+        // Auto-arm single already-permitted non-blocked USB DAC on launch
+        val eligible = audioDevices.filterNot { it.isBlockedDirectXring }
+        if (activeSession == null && armedDevice == null && eligible.size == 1 && eligible[0].hasPermission) {
+            onUsbPermissionReady(eligible[0].device)
         }
     }
 
+    private fun enforceXringDirectUsbBlock(device: UsbDevice): Boolean {
+        if (socProfile.vendor != SocVendor.XRING) return false
+        val allUsb = usbManager.deviceList.values
+        val topo = UsbTopologyDetector.detect(device, allUsb, socProfile.vendor)
+        if (!UsbTopologyDetector.isBlockedForXringDirectUsb(socProfile.vendor, topo, xringAdspCircuitBreakerTripped)) {
+            return false
+        }
+        val name = deviceDisplayName(device)
+        val vidPid = "%04X:%04X".format(device.vendorId, device.productId)
+        armedDevice = null
+        _xringHubDisclaimerActive.value = false
+        _connectionState.value = DacConnectionState.BlockedBySoc(
+            displayName = name,
+            vidPid = vidPid,
+            topologyDetail = topo.detail,
+            circuitBreakerTripped = xringAdspCircuitBreakerTripped
+        )
+        appendLog(
+            3,
+            "XRING-GUARD",
+            "已拦截玄戒 O1 直插 USB 接管请求: $name (${topo.detail}) —— 为防止无限弹窗与整机卡死，直插模式已禁用"
+        )
+        return true
+    }
+
     fun requestConnect(device: UsbDevice) {
+        if (enforceXringDirectUsbBlock(device)) return
         if (usbManager.hasPermission(device)) {
             appendLog(1, "KT", "已有 USB 权限: ${deviceDisplayName(device)}")
             onUsbPermissionReady(device)
@@ -1119,6 +1284,7 @@ class UsbDacManager(context: Context) {
 
     fun claimArmedUsbNow() {
         val dev = armedDevice ?: return
+        if (enforceXringDirectUsbBlock(dev)) return
         scope.launch {
             reconfigureMutex.withLock {
                 if (activeSession == null) {
@@ -1130,6 +1296,7 @@ class UsbDacManager(context: Context) {
     }
 
     private fun onUsbPermissionReady(device: UsbDevice) {
+        if (enforceXringDirectUsbBlock(device)) return
         armedDevice = device
         val name = deviceDisplayName(device)
         val vidPid = "%04X:%04X".format(device.vendorId, device.productId)
@@ -1148,9 +1315,15 @@ class UsbDacManager(context: Context) {
 
     private fun openUsbSessionLocked(device: UsbDevice, initialVolumeDb: Double = 0.0): ActiveUsbSession? {
         activeSession?.let { return it }
+        if (enforceXringDirectUsbBlock(device)) return null
 
         val name = deviceDisplayName(device)
+        val vidPid = "%04X:%04X".format(device.vendorId, device.productId)
         _connectionState.value = DacConnectionState.Connecting(name)
+
+        if (socProfile.vendor == SocVendor.XRING) {
+            lastXringClaimStartMs = SystemClock.elapsedRealtime()
+        }
 
         val connection = usbManager.openDevice(device)
         if (connection == null) {
@@ -1220,7 +1393,27 @@ class UsbDacManager(context: Context) {
             is InspectResult.Failure -> {
                 appendLog(3, "KT", "USB 描述符解析失败: ${inspectResult.error}")
                 runCatching { connection.close() }
-                _connectionState.value = DacConnectionState.Error(inspectResult.error)
+                val errLower = inspectResult.error.lowercase()
+                if (socProfile.vendor == SocVendor.XRING &&
+                    (errLower.contains("no_device") || errLower.contains("-4") || errLower.contains("io") || errLower.contains("detach"))
+                ) {
+                    xringAdspCircuitBreakerTripped = true
+                    armedDevice = null
+                    _xringHubDisclaimerActive.value = false
+                    appendLog(
+                        3,
+                        "XRING-GUARD",
+                        "玄戒 O1 USB 接管触发总线复位 (${inspectResult.error}) -> 已触发防死机熔断保护，禁止继续重试！"
+                    )
+                    _connectionState.value = DacConnectionState.BlockedBySoc(
+                        displayName = name,
+                        vidPid = vidPid,
+                        topologyDetail = "adsp_reset_detected (${inspectResult.error})",
+                        circuitBreakerTripped = true
+                    )
+                } else {
+                    _connectionState.value = DacConnectionState.Error(inspectResult.error)
+                }
                 null
             }
         }
@@ -1231,10 +1424,12 @@ class UsbDacManager(context: Context) {
     // -------------------------------------------------------------------------
 
     fun onMediaProjectionGranted(resultCode: Int, resultData: Intent) {
-        if (activeSession == null && armedDevice == null) {
+        val targetDev = activeSession?.device ?: armedDevice
+        if (targetDev == null) {
             appendLog(2, "KT", "请先接入并授权 USB DAC 后再启动直通")
             return
         }
+        if (enforceXringDirectUsbBlock(targetDev)) return
         appendLog(1, "KT", "已获得 MediaProjection 授权，正在启动前台音频直通服务...")
         val prepText = if (AppLanguageManager.isChinese(appContext)) {
             "BitPerfect USB 独占直通准备中..."
