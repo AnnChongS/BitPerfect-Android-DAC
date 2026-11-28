@@ -35,7 +35,7 @@ data class SocCompatibilityProfile(
         val chip = socDisplayName.ifBlank { if (isZh) vendor.displayNameZh else vendor.displayNameEn }
         return when {
             useQualcommPalPreWarm -> if (isZh) "$chip · PAL 护航" else "$chip · PAL Guard"
-            vendor == SocVendor.XRING -> if (isZh) "$chip · 直插禁用 / Hub 兼容" else "$chip · Direct Blocked / Hub Only"
+            vendor == SocVendor.XRING -> if (isZh) "$chip · 直插锁定 / Hub 兼容" else "$chip · Direct Locked / Hub"
             else -> if (isZh) "$chip · 通用纯净 USB" else "$chip · Universal Pure USB"
         }
     }
@@ -48,9 +48,9 @@ data class SocCompatibilityProfile(
                 "Qualcomm mode: PAL DeepBuffer clock anchor + progressive zero-reset USB takeover"
             }
             SocVendor.XRING -> if (isZh) {
-                "小米玄戒 XRING 防护模式：因内核 xring_usb_adsp 硬锁直插 USB，已禁用直插防死机；仅开放外接 USB Hub（不保证稳定性与音质）"
+                "小米玄戒 XRING 防护模式：因 O1 内核 xring_usb_adsp 硬锁直插，默认锁定防死机（保留高风险免责解锁供新机型/O3自测）；外接 Hub 附免责声明开放"
             } else {
-                "Xiaomi XRING guard mode: Direct USB disabled to prevent ADSP freeze/popup loops; external USB Hub allowed with disclaimer"
+                "Xiaomi XRING guard mode: Direct USB locked by default against O1 ADSP freezes (high-risk override available for newer phones/O3 testing); Hub allowed with disclaimer"
             }
             SocVendor.EXYNOS -> if (isZh) {
                 "三星 Exynos 模式：跳过高通 PAL 预热 · 避让 Capture IRQ + 渐进式无重置 USB 接管"

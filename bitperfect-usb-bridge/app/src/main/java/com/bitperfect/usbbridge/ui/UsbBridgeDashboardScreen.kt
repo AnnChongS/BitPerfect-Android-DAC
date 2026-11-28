@@ -77,6 +77,7 @@ import com.bitperfect.usbbridge.usb.DiscoveredUsbAudioDevice
 import com.bitperfect.usbbridge.usb.LogEntry
 import com.bitperfect.usbbridge.usb.SineTestPreset
 import com.bitperfect.usbbridge.usb.SystemVolumeState
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 // Deep Ocean Obsidian + Glacier Cyan Hi-Fi Palette
@@ -134,6 +135,7 @@ fun UsbBridgeDashboardScreen(
     isBatteryOptIgnored: Boolean,
     xringHubDisclaimerActive: Boolean,
     xringHubDisclaimerAccepted: Boolean,
+    xringDirectOverrideActive: Boolean,
     devices: List<DiscoveredUsbAudioDevice>,
     connectionState: DacConnectionState,
     telemetry: StreamTelemetry,
@@ -147,6 +149,7 @@ fun UsbBridgeDashboardScreen(
     onToggleLanguage: () -> Unit,
     onSelectLanguagePref: (LanguagePref) -> Unit,
     onAcceptXringHubDisclaimer: () -> Unit,
+    onUnlockXringDirectForTesting: () -> Unit,
     onRefreshDevices: () -> Unit,
     onRefreshShizuku: () -> Unit,
     onRequestShizukuPermission: () -> Unit,
@@ -177,6 +180,7 @@ fun UsbBridgeDashboardScreen(
 ) {
     var activeTab by remember { mutableIntStateOf(0) }
     var showAppPickerDialog by remember { mutableStateOf(false) }
+    var showXringDirectUnlockDialog by remember { mutableStateOf(false) }
     var pendingHubAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun runWithXringHubDisclaimer(action: () -> Unit) {
@@ -210,7 +214,11 @@ fun UsbBridgeDashboardScreen(
                 )
             }
 
-            if (xringHubDisclaimerActive) {
+            if (xringDirectOverrideActive) {
+                item {
+                    XringDirectOverrideBanner(s = strings)
+                }
+            } else if (xringHubDisclaimerActive) {
                 item {
                     XringHubDisclaimerBanner(s = strings)
                 }
@@ -234,6 +242,7 @@ fun UsbBridgeDashboardScreen(
                     onRefreshDevices = onRefreshDevices,
                     onConnectDevice = { dev -> runWithXringHubDisclaimer { onConnectDevice(dev) } },
                     onClaimArmedUsbNow = { runWithXringHubDisclaimer(onClaimArmedUsbNow) },
+                    onRequestXringDirectUnlock = { showXringDirectUnlockDialog = true },
                     onDisconnect = onDisconnect
                 )
             }
@@ -354,6 +363,17 @@ fun UsbBridgeDashboardScreen(
                 pendingHubAction = null
                 onAcceptXringHubDisclaimer()
                 pendingAction()
+            }
+        )
+    }
+
+    if (showXringDirectUnlockDialog) {
+        XringDirectUnlockDialog(
+            s = strings,
+            onDismiss = { showXringDirectUnlockDialog = false },
+            onConfirmUnlock = {
+                showXringDirectUnlockDialog = false
+                onUnlockXringDirectForTesting()
             }
         )
     }
@@ -551,6 +571,178 @@ private fun BatteryGuardBanner(
 }
 
 @Composable
+private fun XringDirectOverrideBanner(s: UsbBridgeStrings) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(CoralDimBg)
+            .border(1.5.dp, CoralDanger, RoundedCornerShape(14.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(
+            text = s.xringDirectBannerTitle,
+            color = CoralDanger,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.Bold,
+            lineHeight = 17.sp,
+            style = TightTextStyle
+        )
+        Text(
+            text = s.xringDirectBannerBody,
+            color = TextPrimary,
+            fontSize = 11.sp,
+            lineHeight = 16.sp,
+            style = TightTextStyle
+        )
+    }
+}
+
+@Composable
+private fun XringDirectUnlockDialog(
+    s: UsbBridgeStrings,
+    onDismiss: () -> Unit,
+    onConfirmUnlock: () -> Unit
+) {
+    var riskChecked by remember { mutableStateOf(false) }
+    var countdownSec by remember { mutableIntStateOf(3) }
+
+    LaunchedEffect(Unit) {
+        while (countdownSec > 0) {
+            delay(1000L)
+            countdownSec -= 1
+        }
+    }
+
+    val canConfirm = riskChecked && countdownSec == 0
+    val confirmLabel = when {
+        countdownSec > 0 -> s.xringDirectDialogWaitBtn(countdownSec)
+        !riskChecked -> s.xringDirectDialogCheckFirstBtn
+        else -> s.xringDirectDialogConfirmBtn
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.93f)
+                .clip(RoundedCornerShape(18.dp))
+                .background(CardBg)
+                .border(1.5.dp, CoralDanger, RoundedCornerShape(18.dp))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(CoralDimBg)
+                    .border(1.dp, CoralBorder, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = s.xringDirectDialogTitle,
+                    color = CoralDanger,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    lineHeight = 20.sp,
+                    style = TightTextStyle
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(TileBg)
+                    .border(1.dp, CoralBorder.copy(alpha = 0.75f), RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = s.xringDirectDialogBody,
+                    color = TextPrimary,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                    style = TightTextStyle
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (riskChecked) CoralDimBg else TileBg)
+                    .border(
+                        width = 1.dp,
+                        color = if (riskChecked) CoralDanger else CoralBorder,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .clickable { riskChecked = !riskChecked }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(if (riskChecked) CoralDanger else BgObsidian)
+                        .border(
+                            width = 1.5.dp,
+                            color = if (riskChecked) CoralDanger else TextMuted,
+                            shape = RoundedCornerShape(5.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (riskChecked) {
+                        Text(
+                            text = "✓",
+                            color = BgObsidian,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            style = TightTextStyle
+                        )
+                    }
+                }
+                Text(
+                    text = s.xringDirectDialogCheckbox,
+                    color = if (riskChecked) TextPrimary else TextSecondary,
+                    fontSize = 11.5.sp,
+                    fontWeight = if (riskChecked) FontWeight.SemiBold else FontWeight.Normal,
+                    lineHeight = 16.sp,
+                    style = TightTextStyle,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                UniformButton(
+                    text = s.xringHubDialogCancel,
+                    onClick = onDismiss,
+                    height = 42.dp,
+                    style = BtnStyle.Ghost,
+                    modifier = Modifier.weight(0.75f)
+                )
+                UniformButton(
+                    text = confirmLabel,
+                    onClick = onConfirmUnlock,
+                    enabled = canConfirm,
+                    height = 42.dp,
+                    style = BtnStyle.Danger,
+                    modifier = Modifier.weight(1.45f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun XringHubDisclaimerBanner(s: UsbBridgeStrings) {
     Column(
         modifier = Modifier
@@ -654,6 +846,7 @@ private fun UsbHardwareCard(
     onRefreshDevices: () -> Unit,
     onConnectDevice: (DiscoveredUsbAudioDevice) -> Unit,
     onClaimArmedUsbNow: () -> Unit,
+    onRequestXringDirectUnlock: () -> Unit,
     onDisconnect: () -> Unit
 ) {
     SectionCard {
@@ -736,9 +929,9 @@ private fun UsbHardwareCard(
                         modifier = Modifier.weight(0.9f)
                     )
                     UniformButton(
-                        text = s.btnBlockedDisabled,
-                        onClick = {},
-                        enabled = false,
+                        text = s.btnXringHighRiskUnlock,
+                        onClick = onRequestXringDirectUnlock,
+                        enabled = true,
                         height = 38.dp,
                         style = BtnStyle.Danger,
                         modifier = Modifier.weight(1.3f)
@@ -905,17 +1098,23 @@ private fun UsbHardwareCard(
                         style = BtnStyle.Secondary,
                         modifier = Modifier.weight(1f)
                     )
-                    val canConnectFirst = firstDev != null && !firstDev.isBlockedDirectXring
+                    val isBlockedFirst = firstDev?.isBlockedDirectXring == true
                     UniformButton(
                         text = when {
-                            firstDev?.isBlockedDirectXring == true -> s.btnBlockedDisabled
+                            isBlockedFirst -> s.btnXringHighRiskUnlock
                             firstDev?.hasPermission == true -> s.btnArmReady
                             else -> s.btnGrantConnect
                         },
-                        onClick = { if (canConnectFirst) firstDev?.let(onConnectDevice) },
-                        enabled = canConnectFirst,
+                        onClick = {
+                            if (isBlockedFirst) {
+                                onRequestXringDirectUnlock()
+                            } else {
+                                firstDev?.let(onConnectDevice)
+                            }
+                        },
+                        enabled = firstDev != null,
                         height = 38.dp,
-                        style = if (firstDev?.isBlockedDirectXring == true) BtnStyle.Danger else BtnStyle.Primary,
+                        style = if (isBlockedFirst) BtnStyle.Danger else BtnStyle.Primary,
                         modifier = Modifier.weight(1f)
                     )
                 }

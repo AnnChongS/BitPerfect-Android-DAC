@@ -543,12 +543,28 @@ bool UsbDacEngine::setHardwareVolumeDbLocked(double db, std::string& outError) {
         (static_cast<uint16_t>(fu.id) << 8) | (static_cast<uint16_t>(acIf) & 0xFFu)
     );
 
+    // Always record target hardware gain first so configureHardwareLocked() can re-enforce it
+    // after SET_INTERFACE(Alt#X) even if an early SET_CUR returns transient LIBUSB_ERROR_PIPE.
+    currentVolumeDb_.store(q88 / 256.0, std::memory_order_relaxed);
+
+    auto writeVolumeWithRetry = [&](uint8_t channel) -> int {
+        const uint16_t wValue = static_cast<uint16_t>((uac::FU_VOLUME_CONTROL << 8) | channel);
+        int rc = LIBUSB_ERROR_OTHER;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            rc = controlTransferAcLocked(
+                uac::REQ_TYPE_CLASS_IF_OUT, reqCode, wValue, wIndex, payload, 2, 500
+            );
+            if (rc == 2) return rc;
+            if (attempt < 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            }
+        }
+        return rc;
+    };
+
     bool anyOk = false;
     if (fu.masterVolume) {
-        uint16_t wValue = static_cast<uint16_t>((uac::FU_VOLUME_CONTROL << 8) | 0u);
-        int rc = controlTransferAcLocked(
-            uac::REQ_TYPE_CLASS_IF_OUT, reqCode, wValue, wIndex, payload, 2, 500
-        );
+        int rc = writeVolumeWithRetry(0u);
         if (rc == 2) {
             anyOk = true;
             BP_LOGI("HW Volume FU#%u Master(ch=0) set to %.2f dB (Q8.8=%d)",
@@ -560,29 +576,26 @@ bool UsbDacEngine::setHardwareVolumeDbLocked(double db, std::string& outError) {
         const uint8_t chCount = std::max<uint8_t>(2u, fu.numLogicalChannels);
         int okChannels = 0;
         for (uint8_t ch = 1; ch <= chCount; ++ch) {
-            uint16_t wValue = static_cast<uint16_t>((uac::FU_VOLUME_CONTROL << 8) | ch);
-            int rc = controlTransferAcLocked(
-                uac::REQ_TYPE_CLASS_IF_OUT, reqCode, wValue, wIndex, payload, 2, 500
-            );
+            int rc = writeVolumeWithRetry(ch);
             if (rc == 2) {
                 ++okChannels;
             } else {
-                BP_LOGW("HW Volume FU#%u ch=%u SET_CUR failed: %s",
+                BP_LOGW("HW Volume FU#%u ch=%u SET_CUR failed after 3 tries: %s",
                         fu.id, ch, libusb_error_name(rc));
             }
         }
         anyOk = (okChannels > 0);
-        if (anyOk) {
+        if (okChannels == chCount) {
             BP_LOGI("HW Volume FU#%u Per-Channel(ch=1..%u) set to %.2f dB (Q8.8=%d)",
                     fu.id, chCount, q88 / 256.0, q88);
+        } else if (okChannels > 0) {
+            BP_LOGW("HW Volume FU#%u Per-Channel PARTIAL (%d/%u ok) at %.2f dB (Q8.8=%d)",
+                    fu.id, okChannels, chCount, q88 / 256.0, q88);
         } else {
             outError = "Per-channel volume SET_CUR failed for all channels";
         }
     }
 
-    if (anyOk) {
-        currentVolumeDb_.store(q88 / 256.0, std::memory_order_relaxed);
-    }
     return anyOk;
 }
 
@@ -885,6 +898,18 @@ bool UsbDacEngine::configureHardwareLocked(
 
     // Step 4: Allow DAC PLL, digital filter & unmute relay to settle cleanly before submitting ISO URBs
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+    // Step 5: Re-enforce hardware volume AFTER SET_INTERFACE(Alt#X) so DAC chips that reset
+    // internal FeatureUnit gain to 0.0 dB on rate/bit-depth switches (or transiently returned PIPE
+    // before AltSetting activation) NEVER blast the user's ears!
+    if (profile_.hasPlaybackFeatureUnit &&
+        (profile_.playbackFeatureUnit.masterVolume || profile_.playbackFeatureUnit.channelVolume)) {
+        const double targetVolDb = currentVolumeDb_.load(std::memory_order_relaxed);
+        std::string volErr;
+        if (!setHardwareVolumeDbLocked(targetVolDb, volErr)) {
+            BP_LOGW("Post-AltSetting HW volume re-apply (%.2f dB) failed: %s", targetVolDb, volErr.c_str());
+        }
+    }
 
     activeAlt_ = alt;
     activeSampleRate_ = sampleRate;

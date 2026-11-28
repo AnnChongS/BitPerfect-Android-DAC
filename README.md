@@ -27,12 +27,14 @@ This repository contains **two independent Android apps** sharing the same flags
 
 ---
 
-### 2. Requirements & Compatibility (`v1.0.1`)
+### 2. Requirements & Compatibility (`USB Bridge v1.1.0` / `Root DAC v1.0.1`)
 
 - **Android Version**: Android 14 (API 34) – Android 17 (API 36+), `arm64-v8a` only.
 - **16 KB Page Size Ready**: Both `libbitperfect_usb_audio.so` and `libc++_shared.so` are compiled with `-Wl,-z,max-page-size=16384` (`PT_LOAD` alignment `0x4000`) and stored uncompressed for Android 15–17 devices.
 - **Hardware**: External USB Type-C UAC 1.0 / UAC 2.0 Audio DAC dongle (tested extensively on **MOONDROP Muse Dash & Quark2**, CS43131 / ESS / AKM USB dongles).
-- **Current Focus (`v1.0.1`)**: Tuned primarily for **Apple Music** (`com.apple.android.music`) on **Qualcomm Snapdragon (PAL)** devices. Universal multi-player & multi-SoC (MediaTek Dimensity / Google Tensor / Samsung Exynos) support is planned for **`v1.1.0`** on branch `feat/universal-soc-and-players`.
+- **Edition Status**:
+  - **`BitPerfect USB Bridge v1.1.0` (Released)**: Full **Multi-SoC** (**Qualcomm Snapdragon**, **Samsung Exynos** verified zero-root, **MediaTek Dimensity**, **Google Tensor**, **Xiaomi XRING** direct-USB guard + Hub disclaimer) + **Universal Multi-Player & Rhythm-Game 60 ms Low Latency** + **Anti-Speaker-Blast & Anti-0dB-Ear-Blast Shields**.
+  - **`BitPerfect Root DAC v1.0.1`** (`v1.1.0` coming next): True `24-bit/192 kHz` LSPosed hook for Apple Music on Snapdragon; upcoming `v1.1.0` will expand to multi-player + multi-SoC (including Xiaomi XRING Root ADSP unlock).
 
 ---
 
@@ -101,9 +103,9 @@ Check these two common causes:
 
 ---
 
-### 7. Roadmap (`v1.1.0` — Branch `feat/universal-soc-and-players`)
-- **Universal Multi-Player Support**: Global `USAGE_MEDIA` auto-tracking (excluding self UID) + per-app picker for Apple Music, Spotify, Tidal, Qobuz, NetEase Cloud Music, QQ Music, Foobar2000, HibyMusic, etc., with live active-app display.
-- **Multi-SoC Hardware Compatibility**: Automatic SoC detection (`Qualcomm Snapdragon`, `MediaTek Dimensity`, `Google Tensor`, `Samsung Exynos`, `Generic ARM`) with platform-tailored USB interface handoff, zero `libusb_reset_device()` teardown, and dynamic `r_submix` ceiling probing.
+### 7. Roadmap (`v1.1.0`)
+- **`BitPerfect USB Bridge v1.1.0` — Shipped**: Universal multi-player capture (`Global` + searchable `Single App`), `60 ms` rhythm-game low-latency mode, Multi-SoC engine (Snapdragon / Exynos / Dimensity / Tensor / XRING direct-USB high-risk guard + Hub disclaimer), Anti-Speaker-Blast & Anti-0dB-Ear-Blast shields, and dynamic `r_submix` probing.
+- **`BitPerfect Root DAC v1.1.0` — Up Next**: Multi-player LSPosed scope + Multi-SoC support + Xiaomi XRING O1 Root `xring_usb_adsp` direct-USB unlock.
 
 ---
 
@@ -128,11 +130,13 @@ Check these two common causes:
 
 ---
 
-### 2. 环境与硬件要求（`v1.0.1`）
+### 2. 环境与硬件要求（`USB Bridge v1.1.0` / `Root DAC v1.0.1`）
 
 - **系统要求**：Android 14 – Android 17（`arm64-v8a`），原生通过 Android 15–17 **16 KB 内存页对齐**（`0x4000`）。
 - **外接硬件**：支持标准 USB Audio Class 1.0 / 2.0（UAC1/UAC2）的 Type-C 解码耳放小尾巴（已在水月雨 `MOONDROP Muse Dash & Quark2` 等 UAC2 小尾巴上深度实测验证）。
-- **当前定位（`v1.0.1`）**：核心针对 **Apple Music** 与 **高通 Snapdragon（PAL 音频框架）** 深度调优；**全手机芯片平台（天玑 / Tensor / Exynos）与全音乐软件通用适配**将在 `v1.1.0`（`feat/universal-soc-and-players` 分支）推出。
+- **当前版本进度**：
+  - **`BitPerfect USB Bridge v1.1.0`（已发布）**：全面升级 **全芯片平台**（高通骁龙 / 三星 Exynos 纯无 Root 实测通过 / 天玑 / Tensor / 小米玄戒直插防死机护盾 + 高风险解锁测试 + Hub 免责模式）+ **全音乐/音游软件捕获 & 60 ms 音游低延迟** + **防外放社死盾 & 防切频 0 dB 炸耳保护**。
+  - **`BitPerfect Root DAC v1.0.1`**（下一步升级 `v1.1.0`）：真 `24-bit/192 kHz` 源码直通；后续 `v1.1.0` 将扩展全应用、多 SoC 与小米玄戒 Root 专属 ADSP 解锁。
 
 ---
 

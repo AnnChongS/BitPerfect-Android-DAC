@@ -197,17 +197,21 @@ object UsbTopologyDetector {
     }
 
     /**
-     * Fail-closed XRING direct-USB block policy:
-     * On Xiaomi XRING O1, ONLY Hub-connected DACs are permitted (with disclaimer), and if the
-     * runtime ADSP-reset circuit breaker has tripped, everything on that plug session is blocked.
+     * Fail-closed XRING direct-USB protection policy:
+     * On Xiaomi XRING devices, direct-plugged DACs are locked by default (Hub is allowed with
+     * disclaimer). Users on newer XRING phones / future XRING O3 / newer ROMs can explicitly
+     * unlock direct USB for the current plug session via the high-friction red disclaimer dialog;
+     * if the runtime ADSP-reset circuit breaker trips, it always locks back immediately.
      */
     fun isBlockedForXringDirectUsb(
         socVendor: SocVendor,
         info: UsbTopologyInfo,
-        circuitBreakerTripped: Boolean
+        circuitBreakerTripped: Boolean,
+        directTestOverrideUnlocked: Boolean = false
     ): Boolean {
         if (socVendor != SocVendor.XRING) return false
         if (circuitBreakerTripped) return true
+        if (directTestOverrideUnlocked) return false
         return info.topology != UsbConnectionTopology.VIA_USB_HUB
     }
 

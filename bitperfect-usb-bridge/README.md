@@ -1,4 +1,4 @@
-# BitPerfect USB Bridge
+# BitPerfect USB Bridge (`v1.1.0`)
 
 [English](#english) | [中文说明](#中文说明)
 
@@ -6,24 +6,22 @@
 
 ## English
 
-**BitPerfect USB Bridge** is an audiophile-grade **Zero-Root / Shizuku** exclusive USB Audio Class 1.0/2.0 (UAC1/UAC2) DAC bridge for **Android 14 – 17** (`arm64-v8a`, 16 KB page-size aligned). It routes internal audio from **Apple Music** (and other media apps supporting `AudioPlaybackCapture`) directly to external USB Type-C DAC dongles via custom C++ `libusb` isochronous transfers, bypassing Android's mandatory 48 kHz system USB mixer resampling.
+**BitPerfect USB Bridge** is a universal **Zero-Root / Shizuku** exclusive USB Audio Class 1.0/2.0 (UAC1/UAC2) DAC bridge for **Android 14 – 17** (`arm64-v8a`, **16 KB page-size aligned**). It captures internal audio from **any music player, audio app, or rhythm game** (`AudioPlaybackCapture`, `USAGE_MEDIA + USAGE_GAME + USAGE_UNKNOWN`) and streams directly to external USB Type-C DAC dongles via a custom C++17 `libusb` isochronous engine — bypassing Android's mandatory 48 kHz USB mixer resampling.
 
-### Key Features
-- **Dual Operating Modes (Zero Root Required)**:
-  - **Manual Mode (Pure Non-Root)**: Select `44.1 kHz` (`44.1 / 88.2 / 176.4 kHz` integer family) or `48.0 kHz` (`48 / 96 / 192 kHz` integer family) with zero ADB or Root setup.
-  - **Shizuku Auto Mode (`uid=2000`)**: Automatically sniffs Apple Music's active track sample rate via `dumpsys audio` and switches DAC clocks between `44.1 kHz` and `48.0 kHz` families seamlessly.
-- **Custom C++17 `libusb` UAC1/UAC2 Engine**:
-  - Two-stage glitch-free kernel driver handoff (`IF#2` Playback -> `IF#0` AudioControl while leaving `IF#1` Microphone untouched).
-  - Full UAC2 `ClockSource` / `ClockSelector` verification + asynchronous/adaptive 12-URB Isochronous OUT engine + `4 MB` lock-free SPSC ring buffer.
-  - True hardware UAC FeatureUnit volume control (`0.5 dB` precision) + `24-bit (S24_3LE)` / `32-bit (S32_LE)` wire format selection.
-- **Qualcomm PAL Anti-Stutter & Auto-Heal**:
-  - Pre-warms `PAL_STREAM_DEEP_BUFFER` prior to `snd-usb-audio` detachment and includes an automatic `zeroDrops` self-healing watchdog across Hi-Res track transitions.
-- **System Volume Guard**:
-  - Live `STREAM_MUSIC` volume monitor with 1-tap `Set 100% (0 dB)` restoration to prevent muted or bit-reduced `AudioPlaybackCapture`.
-- **Bilingual UI (English & 中文)**:
-  - Automatically follows system language (`zh*` -> Chinese, all other locales -> English) with instant 1-tap in-app switching.
-
-> **Note on >48 kHz Hi-Res**: Stock Android's `r_submix` virtual capture HAL is capped at `48 kHz`. To avoid blurry non-integer resampling, `88.2/176.4 kHz` tracks map cleanly by integer divisor to `44.1 kHz` and `96/192 kHz` tracks map to `48.0 kHz`. For true `24-bit / 192 kHz` un-downsampled output on rooted devices, see sister project **BitPerfect Root DAC**.
+### What's New in `v1.1.0` (Universal Multi-SoC & Multi-Player)
+- **Universal Multi-SoC Compatibility**:
+  - Automatic runtime SoC profiling for **Qualcomm Snapdragon**, **Samsung Exynos**, **MediaTek Dimensity**, **Google Tensor**, **Xiaomi XRING**, and generic ARM devices.
+  - Isolates Qualcomm PAL DeepBuffer pre-warm strictly to Snapdragon chips; non-Qualcomm SoCs use progressive offload-safe USB detach, zero illegal ISO `libusb_clear_halt()`, zero `libusb_reset_device()`, and a single-segment xHCI ISO ring (`< 255 TRBs`) for rock-solid zero-root playback on Samsung Exynos & other non-Qualcomm devices.
+- **Universal Multi-Player + Rhythm-Game Low Latency**:
+  - **Global Auto-Track** (captures all music / audio / rhythm-game apps, automatically excluding self) or **Single-App Lock** via a searchable full-device App Picker (Apple Music, Spotify, Tidal, NetEase Cloud, QQ Music, DLsite Sound, Phigros, Arcaea, Cytus, etc.).
+  - **60 ms Rhythm-Game Low-Latency Mode** (`10 ms` AudioRecord chunks + `12 ms` / `24 ms` DMA ring) alongside `150 / 250 / 400 ms` Hi-Fi jitter-free presets.
+- **Anti-Speaker-Blast & Anti-Ear-Blast Shields**:
+  - In-place `Global <-> Single App` capture swap without closing the USB DAC, plus automatic `STREAM_MUSIC` mute + `KEYCODE_MEDIA_PAUSE` shield during scope switches, rebinds, stops, and unplugs so audio never blasts out of phone speakers at 100% volume.
+  - Hardware volume retry (up to 3 attempts per channel) + automatic post-`SET_INTERFACE` hardware gain re-enforcement so switching sample rates (`44.1 <-> 48 kHz`) or bit depth (`24 <-> 32-bit`) never resets DAC hardware gain to `0 dB`.
+- **Xiaomi XRING Protection & Hub Disclaimer**:
+  - On Xiaomi XRING devices where kernel `xring_usb_adsp` hijacks direct-plugged USB DACs (known on XRING O1 Tablet HyperOS OS4.0.6.0), direct USB is locked by default with a high-friction red risk-confirmation override (for testing XRING O1 phones / future XRING O3 / newer ROMs) + runtime ADSP-reset circuit breaker. External USB Hub connections are allowed with an explicit stability & audio-quality disclaimer.
+- **Dynamic `r_submix` Probing & Shizuku Auto-Rate (`uid=2000`)**:
+  - Automatically probes the device's `r_submix` ceiling via Shizuku for native Hi-Res pass-through when supported, or clean integer-divisor locking (`44.1 / 48 kHz` families) on stock 48 kHz HALs.
 
 ### Building from Source
 1. Requirements: JDK 17+, Android SDK Platform 36, Android NDK `27.0.12077973`, CMake `3.22.1`.
@@ -32,29 +30,32 @@
    ```bash
    ./gradlew assembleRelease
    ```
-   *(Optional)* Create `keystore.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`) in project root for custom release signing; otherwise Gradle automatically signs with the debug key for local testing.
+   *(Optional)* Create `keystore.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`) in project root for release signing; otherwise Gradle falls back to debug signing.
 
 ---
 
 ## 中文说明
 
-**BitPerfect USB Bridge** 是一款专为 **Android 14 – 17**（`arm64-v8a`，原生支持 `16 KB` 内存页对齐）打造的 **免 Root / Shizuku 双模** USB UAC1/UAC2 解码耳放（小尾巴）独占直通工具。它通过底层 C++ `libusb` 异步等时传输直接驱动外接 USB DAC，绕过 Android 系统默认对 USB 声卡的 48 kHz 强制重采样。
+**BitPerfect USB Bridge** 是一款专为 **Android 14 – 17**（`arm64-v8a`，原生支持 `16 KB` 内存页对齐）打造的全平台 **免 Root / Shizuku 双模** USB UAC1/UAC2 解码耳放（小尾巴）独占直通工具。它通过底层 C++17 `libusb` 等时传输直接驱动外接 USB DAC，支持捕获**任意音乐软件、音声应用与音游**内部音频，绕过 Android 系统默认对 USB 声卡的 48 kHz 强制重采样。
 
-### 核心特性
-- **双模式架构（完全免 Root）**：
-  - **无 Root 手动模式**：零门槛即插即用，提供 `44.1 kHz 基准`（适配 `44.1/88.2/176.4k`）与 `48.0 kHz 基准`（适配 `48/96/192k`）整数分频锁定。
-  - **Shizuku 自动模式 (`uid=2000`)**：通过无线调试授权 Shizuku 后，自动嗅探 Apple Music 当前曲目采样率并在 `44.1 / 48 kHz` 时钟族之间无感切换。
-- **自研 C++17 `libusb` UAC1/UAC2 独占引擎**：
-  - 两阶段纯净接管（先接管 `IF#2` 播放流并完成静音握手，再接管 `IF#0` 控制接口，跳过 `IF#1` 麦克风接口避免干扰 ADC 时钟）。
-  - 支持 UAC2 硬件音量寄存器（`0.5 dB` 步进）、`24-bit (S24_3LE)` / `32-bit (S32_LE)` 传输位深切换、`4 MB` 零锁 SPSC 环形缓冲与内置 `440 Hz` 双精度硬件晶振自检。
-- **高通 PAL 防卡顿与自动自愈**：
-  - 内置 `PAL_STREAM_DEEP_BUFFER` 预热与 Hi-Res 切歌主动重同步 + `zeroDrops` 静音洞自愈看门狗，彻底解决切歌卡顿与二次连接杂音。
-- **系统音量满幅守护 + 中英双语自适应**：
-  - 实时检测手机媒体音量，未满格或静音时提供「一键满格（0 dB 无损位深）」按钮；界面默认跟随系统语言（中文系统显示中文，英文及其他语言系统显示英文），并支持右上角一键切换。
+### `v1.1.0` 核心升级（全芯片平台 · 全音乐/音游软件 · 双重防爆音）
+- **全芯片平台通用适配**：
+  - 自动识别 **高通骁龙（Snapdragon）**、**三星 Exynos**、**联发科天玑（Dimensity）**、**Google Tensor**、**小米玄戒（XRING）** 及通用 ARM 平台。
+  - 高通 PAL DeepBuffer 预热严格隔离至高通平台；非高通平台采用通用 Offload 安全接管顺序、彻底移除非法 ISO `clear_halt` 与 `libusb_reset_device`，并启用单段 xHCI 安全环（`< 255 TRBs`），**已在三星纯无 Root 环境实测稳定直出**。
+- **全应用捕获 + 60 ms 音游低延迟**：
+  - 支持 **全局自动追踪**（自动捕获所有第三方音乐/音声/音游应用，排除本应用）与 **指定单个 App 锁定**（内置可搜索全机应用选择器，支持 Apple Music、网易云、QQ 音乐、DLsite Sound、Phigros、Arcaea 等）。
+  - 新增 **60 ms 音游低延迟档位**，并保留 `150 / 250 / 400 ms` Hi-Fi 抗抖动档位。
+- **防外放社死盾 + 防切频 0 dB 炸耳保护**：
+  - **防外放爆音盾**：切换“全局 ↔ 单应用”原地热切换不断开 USB；切频重绑定、停止直通或拔出耳机时自动静音系统媒体通道并发送暂停指令，防止公共场合 100% 音量外放。
+  - **防硬件音量回弹 0 dB**：底层 C++ 新增单声道失败自动重试（最多 3 次）以及 `SET_INTERFACE` 切频/切位深后自动二次强锁目标 dB，彻底根治切换 `44.1/48 kHz` 或 `24/32-bit` 时硬件音量偶发回弹 `0 dB` 炸耳。
+- **小米玄戒（XRING）直插防死机护盾 + Hub 免责模式**：
+  - 自动识别直插与外接 USB Hub 拓扑；针对已知玄戒 O1 平板（OS4.0.6.0）内核 `xring_usb_adsp` 锁死直插声卡的问题，默认锁定直插并内置 ADSP 复位防死机熔断，同时保留醒目的**红色高风险免责解锁入口**（含勾选确认 + 3 秒阅读倒计时）供玄戒 O1 手机 / 未来玄戒 O3 / 新版系统测试；外接 USB Hub 则在提示不稳定与音质不保证免责声明后开放。
+- **中英双语自适应 + 动态 `r_submix` 探测**：
+  - 界面随系统语言自动切换中文/英文并支持右上角一键切换；授权 Shizuku 后自动嗅探全机任意活跃播放器采样率与系统 `r_submix` 能力上限。
 
 ### 源码编译
 1. 环境要求：JDK 17+、Android SDK 36、NDK `27.0.12077973`、CMake `3.22.1`。
-2. 在 Windows / macOS / x86_64 Linux 上编译前，请注释掉 `gradle.properties` 最后一行的 `android.aapt2FromMavenOverride`。
+2. 在 Windows / macOS / x86_64 Linux 上编译前，请注释掉 `gradle.properties` 中的 `android.aapt2FromMavenOverride`。
 3. 执行构建：
    ```bash
    ./gradlew assembleRelease

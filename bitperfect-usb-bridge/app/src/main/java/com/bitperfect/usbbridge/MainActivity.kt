@@ -117,6 +117,7 @@ class MainActivity : ComponentActivity() {
                 val systemMusicVolume by usbDacManager.systemMusicVolume.collectAsState()
                 val xringHubDisclaimerActive by usbDacManager.xringHubDisclaimerActive.collectAsState()
                 val xringHubDisclaimerAccepted by usbDacManager.xringHubDisclaimerAccepted.collectAsState()
+                val xringDirectOverrideActive by usbDacManager.xringDirectOverrideActive.collectAsState()
                 val devices by usbDacManager.discoveredDevices.collectAsState()
                 val connectionState by usbDacManager.connectionState.collectAsState()
                 val telemetry by usbDacManager.telemetry.collectAsState()
@@ -150,6 +151,7 @@ class MainActivity : ComponentActivity() {
                     isBatteryOptIgnored = isBatteryOptIgnored,
                     xringHubDisclaimerActive = xringHubDisclaimerActive,
                     xringHubDisclaimerAccepted = xringHubDisclaimerAccepted,
+                    xringDirectOverrideActive = xringDirectOverrideActive,
                     devices = devices,
                     connectionState = connectionState,
                     telemetry = telemetry,
@@ -163,6 +165,7 @@ class MainActivity : ComponentActivity() {
                     onToggleLanguage = { AppLanguageManager.toggleLanguage(this) },
                     onSelectLanguagePref = { pref -> AppLanguageManager.setLanguagePref(this, pref) },
                     onAcceptXringHubDisclaimer = { usbDacManager.acceptXringHubDisclaimer() },
+                    onUnlockXringDirectForTesting = { usbDacManager.unlockXringDirectForTesting() },
                     onRefreshDevices = { usbDacManager.refreshDevices() },
                     onRefreshShizuku = { usbDacManager.refreshShizukuStatus() },
                     onRequestShizukuPermission = { usbDacManager.requestShizukuPermission() },
